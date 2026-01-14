@@ -12,13 +12,10 @@
 
 # %%
 from snowflake.snowpark.context import get_active_session
-from snowflake.snowpark import functions as F
-import pandas as pd
 
 session = get_active_session()
 
 # Set context
-session.sql("USE WAREHOUSE ARCA_DEMO_WH").collect()
 session.sql("USE DATABASE BD_AA_DEV").collect()
 session.sql("USE SCHEMA SC_STORAGE_BMX_PS").collect()
 
@@ -50,12 +47,19 @@ print(f"\n📋 Columns ({len(columns)}):")
 for col in columns:
     print(f"   - {col}")
 
-# Check for target variable
-if 'uni_box_week' in columns:
-    print(f"\n✅ Target variable 'uni_box_week' found")
+# Check for target variable (case-insensitive)
+columns_lower = [col.lower() for col in columns]
+if 'uni_box_week' in columns_lower:
+    # Find the actual column name (preserving case)
+    target_col = columns[columns_lower.index('uni_box_week')]
+    print(f"\n✅ Target variable 'uni_box_week' found (as '{target_col}')")
 else:
     print(f"\n❌ Target variable 'uni_box_week' NOT found!")
+    print(f"   Available columns: {', '.join(columns)}")
     raise ValueError("Target variable 'uni_box_week' is required")
+
+# Store target column name for later use
+TARGET_COLUMN = target_col
 
 # %% [markdown]
 # ## 2. Validate Inference Dataset
@@ -76,7 +80,8 @@ except Exception as e:
 
 # Verify target is NOT in inference
 inference_columns = inference_df.columns
-if 'uni_box_week' in inference_columns:
+inference_columns_lower = [col.lower() for col in inference_columns]
+if 'uni_box_week' in inference_columns_lower:
     print(f"\n⚠️  WARNING: Target variable 'uni_box_week' found in inference dataset")
     print(f"   This is expected - inference should not have target values")
 else:
@@ -180,7 +185,7 @@ excluded_cols = [
 
 # Get feature columns from training (exclude target + excluded)
 train_feature_cols = [col for col in columns 
-                     if col not in excluded_cols + ['uni_box_week']]
+                     if col not in excluded_cols and col != TARGET_COLUMN]
 
 # Get feature columns from inference (exclude excluded)
 inference_feature_cols = [col for col in inference_columns 
