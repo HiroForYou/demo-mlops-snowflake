@@ -1,11 +1,11 @@
 # %% [markdown]
 # # Migration: Create Partitioned Model
-# 
+#
 # ## Overview
 # This script creates a partitioned model from the trained XGBoost model.
 # Even though we have a single model, we create a partitioned model to enable
 # partitioned inference syntax for consistency and future scalability.
-# 
+#
 # ## What We'll Do:
 # 1. Load trained model from Model Registry
 # 2. Create CustomModel class with partitioned API
@@ -27,9 +27,7 @@ session.sql("USE DATABASE BD_AA_DEV").collect()
 session.sql("USE SCHEMA SC_STORAGE_BMX_PS").collect()
 
 registry = Registry(
-    session=session,
-    database_name="BD_AA_DEV",
-    schema_name="MODEL_REGISTRY"
+    session=session, database_name="BD_AA_DEV", schema_name="MODEL_REGISTRY"
 )
 
 print("✅ Connected to Snowflake")
@@ -40,26 +38,26 @@ print(f"   Schema: {session.get_current_schema()}")
 # ## 1. Verify Trained Model Exists
 
 # %%
-print("\n" + "="*80)
+print("\n" + "=" * 80)
 print("🔍 VERIFYING TRAINED MODEL")
-print("="*80)
+print("=" * 80)
 
 model_name = "uni_box_regression_model"
 
 try:
     model_ref = registry.get_model(model_name)
     model_version = model_ref.version("PRODUCTION")
-    
+
     print(f"\n✅ Model found: {model_name}")
     print(f"   Version: {model_version.version_name}")
     print(f"   Alias: PRODUCTION")
-    
+
     # Load the model to get feature columns
     native_model = model_version.load()
     print(f"   Model type: {type(native_model).__name__}")
-    
+
     # Get feature columns from model metadata
-    if hasattr(native_model, 'feature_cols'):
+    if hasattr(native_model, "feature_cols"):
         feature_cols = native_model.feature_cols
     else:
         # Fallback: get from sample input
@@ -68,9 +66,9 @@ try:
             feature_cols = sample_input.columns
         else:
             raise ValueError("Cannot determine feature columns from model")
-    
+
     print(f"   Features: {len(feature_cols)}")
-    
+
 except Exception as e:
     print(f"\n❌ Error loading model: {str(e)}")
     print("   Please run 04_many_model_training.py first")
@@ -80,68 +78,85 @@ except Exception as e:
 # ## 2. Define Partitioned Model Class
 
 # %%
-print("\n" + "="*80)
+print("\n" + "=" * 80)
 print("🔧 DEFINING PARTITIONED MODEL CLASS")
-print("="*80)
+print("=" * 80)
+
 
 class PartitionedUniBoxModel(custom_model.CustomModel):
     """
     Partitioned model for uni_box_week regression.
     Uses the same model for all partitions (single model scenario).
     """
+
     def __init__(self, model_context):
         super().__init__(model_context)
         # Feature columns will be determined from the model
         self.feature_cols = None
-    
+
     @custom_model.partitioned_api
     def predict(self, input_df: pd.DataFrame) -> pd.DataFrame:
         """
         Predict uni_box_week using partitioned API.
-        
+
         Args:
             input_df: DataFrame with features and partition columns
-        
+
         Returns:
             DataFrame with predictions
         """
         if len(input_df) == 0:
-            return pd.DataFrame(columns=['customer_id', 'predicted_uni_box_week'])
-        
+            return pd.DataFrame(columns=["customer_id", "predicted_uni_box_week"])
+
         # Get the model from context
         # For single model, use "main_model" key
         model = self.context.model_ref("main_model")
-        
+
         # Determine feature columns if not set
         if self.feature_cols is None:
-            if hasattr(model, 'feature_cols'):
+            if hasattr(model, "feature_cols"):
                 self.feature_cols = model.feature_cols
             else:
                 # Infer from input (exclude metadata columns)
-                metadata_cols = ['customer_id', 'brand_pres_ret', 'week', 
-                               'group', 'stats_group', 'percentile_group', 'stats_ntile_group']
-                self.feature_cols = [col for col in input_df.columns 
-                                   if col not in metadata_cols]
-        
+                metadata_cols = [
+                    "customer_id",
+                    "brand_pres_ret",
+                    "week",
+                    "group",
+                    "stats_group",
+                    "percentile_group",
+                    "stats_ntile_group",
+                ]
+                self.feature_cols = [
+                    col for col in input_df.columns if col not in metadata_cols
+                ]
+
         # Prepare features
         X = input_df[self.feature_cols].fillna(0)
-        
+
         # Make predictions
         predictions = model.predict(X)
-        
+
         # Flatten if needed
-        if hasattr(predictions, 'flatten'):
+        if hasattr(predictions, "flatten"):
             predictions = predictions.flatten()
         elif isinstance(predictions, np.ndarray) and len(predictions.shape) > 1:
             predictions = predictions.ravel()
-        
+
         # Return predictions with customer_id
-        result = pd.DataFrame({
-            'customer_id': input_df['customer_id'].values if 'customer_id' in input_df.columns else range(len(predictions)),
-            'predicted_uni_box_week': predictions
-        })
-        
+        result = pd.DataFrame(
+            {
+                "customer_id": (
+                    input_df["customer_id"].values
+                    if "customer_id" in input_df.columns
+                    else range(len(predictions))
+                ),
+                "predicted_uni_box_week": predictions,
+            }
+        )
+
         return result
+
 
 print("✅ PartitionedUniBoxModel class defined")
 
@@ -149,16 +164,12 @@ print("✅ PartitionedUniBoxModel class defined")
 # ## 3. Create Model Context and Partitioned Model
 
 # %%
-print("\n" + "="*80)
+print("\n" + "=" * 80)
 print("📦 CREATING PARTITIONED MODEL")
-print("="*80)
+print("=" * 80)
 
 # Create ModelContext with the trained model
-model_context = custom_model.ModelContext(
-    models={
-        "main_model": native_model
-    }
-)
+model_context = custom_model.ModelContext(models={"main_model": native_model})
 
 # Create partitioned model instance
 partitioned_model = PartitionedUniBoxModel(model_context=model_context)
@@ -174,10 +185,7 @@ print("\n📝 Preparing sample input...")
 training_df = session.table("BD_AA_DEV.SC_STORAGE_BMX_PS.TRAIN_DATASET_CLEANED")
 
 # Prepare sample with all required columns
-sample_input = training_df.select(
-    'customer_id',
-    *feature_cols
-).limit(5)
+sample_input = training_df.select("customer_id", *feature_cols).limit(5)
 
 print(f"✅ Sample input prepared: {sample_input.count()} rows")
 
@@ -185,11 +193,11 @@ print(f"✅ Sample input prepared: {sample_input.count()} rows")
 # ## 5. Register Partitioned Model
 
 # %%
-print("\n" + "="*80)
+print("\n" + "=" * 80)
 print("📝 REGISTERING PARTITIONED MODEL")
-print("="*80)
+print("=" * 80)
 
-version_date = datetime.now().strftime('%Y%m%d_%H%M')
+version_date = datetime.now().strftime("%Y%m%d_%H%M")
 
 print(f"\n📝 Registering in Model Registry...")
 print(f"   Name: UNI_BOX_REGRESSION_PARTITIONED")
@@ -205,19 +213,19 @@ try:
             "source_model": model_name,
             "source_version": model_version.version_name,
             "num_features": len(feature_cols),
-            "model_type": "XGBoost"
+            "model_type": "XGBoost",
         },
         sample_input_data=sample_input,
         task=task.Task.TABULAR_REGRESSION,
-        options={"function_type": "TABLE_FUNCTION"}
+        options={"function_type": "TABLE_FUNCTION"},
     )
-    
+
     print("\n✅ Partitioned model registered successfully!")
-    
+
     # Set PRODUCTION alias
     mv.set_alias("PRODUCTION")
     print(f"🏷️  Alias 'PRODUCTION' configured")
-    
+
 except Exception as e:
     print(f"\n❌ Error registering model: {str(e)}")
     raise
@@ -226,22 +234,26 @@ except Exception as e:
 # ## 6. Verify Registration
 
 # %%
-print("\n" + "="*80)
+print("\n" + "=" * 80)
 print("🔍 VERIFYING REGISTRATION")
-print("="*80)
+print("=" * 80)
 
-result = session.sql("""
+result = session.sql(
+    """
     SHOW MODELS LIKE 'UNI_BOX_REGRESSION_PARTITIONED' 
     IN SCHEMA BD_AA_DEV.MODEL_REGISTRY
-""").collect()
+"""
+).collect()
 
 if result:
     print("✅ Partitioned model found in registry")
-    
-    versions = session.sql("""
+
+    versions = session.sql(
+        """
         SHOW VERSIONS IN MODEL BD_AA_DEV.MODEL_REGISTRY.UNI_BOX_REGRESSION_PARTITIONED
-    """).collect()
-    
+    """
+    ).collect()
+
     print(f"\n📊 Versions: {len(versions)}")
     for v in versions[-3:]:
         print(f"   - {v['name']}")
@@ -252,19 +264,20 @@ else:
 # ## 7. Test Partitioned Inference (Quick Test)
 
 # %%
-print("\n" + "="*80)
+print("\n" + "=" * 80)
 print("🧪 TESTING PARTITIONED INFERENCE")
-print("="*80)
+print("=" * 80)
 
 # Create a dummy partition column for testing
-test_data = training_df.select(
-    'customer_id',
-    *feature_cols
-).limit(10).with_column("dummy_partition", F.lit("ALL"))
+test_data = (
+    training_df.select("customer_id", *feature_cols)
+    .limit(10)
+    .with_column("dummy_partition", F.lit("ALL"))
+)
 
 # Save test data temporarily
-test_data.write.mode('overwrite').save_as_table(
-    'BD_AA_DEV.SC_STORAGE_BMX_PS.TEST_INFERENCE_TEMP'
+test_data.write.mode("overwrite").save_as_table(
+    "BD_AA_DEV.SC_STORAGE_BMX_PS.TEST_INFERENCE_TEMP"
 )
 
 print("\n📊 Test data prepared: 10 samples")
@@ -323,19 +336,25 @@ try:
     print("\n📊 Sample predictions:")
     test_results.show()
 except Exception as e:
-    print(f"\n⚠️  Test inference error (this is OK if feature order differs): {str(e)[:200]}")
-    print("   The model is registered correctly, feature order will be handled in inference script")
+    print(
+        f"\n⚠️  Test inference error (this is OK if feature order differs): {str(e)[:200]}"
+    )
+    print(
+        "   The model is registered correctly, feature order will be handled in inference script"
+    )
 
 # Clean up test table
-session.sql("DROP TABLE IF EXISTS BD_AA_DEV.SC_STORAGE_BMX_PS.TEST_INFERENCE_TEMP").collect()
+session.sql(
+    "DROP TABLE IF EXISTS BD_AA_DEV.SC_STORAGE_BMX_PS.TEST_INFERENCE_TEMP"
+).collect()
 
 # %% [markdown]
 # ## 8. Summary
 
 # %%
-print("\n" + "="*80)
+print("\n" + "=" * 80)
 print("✅ PARTITIONED MODEL CREATION COMPLETE!")
-print("="*80)
+print("=" * 80)
 
 print("\n📋 Summary:")
 print(f"   ✅ Source model: {model_name}")
@@ -347,11 +366,13 @@ print(f"   ✅ Features: {len(feature_cols)}")
 print("\n💡 Next Steps:")
 print("   1. Review partitioned model registration")
 print("   2. Run 06_partitioned_inference_batch.py for batch inference")
-print("   3. Use partitioned inference syntax: TABLE(model!PREDICT(...) OVER (PARTITION BY ...))")
+print(
+    "   3. Use partitioned inference syntax: TABLE(model!PREDICT(...) OVER (PARTITION BY ...))"
+)
 
 print("\n🎯 Key Benefits:")
 print("   - Single model with partitioned API")
 print("   - Consistent inference syntax")
 print("   - Ready for future multi-model scenarios")
 
-print("\n" + "="*80)
+print("\n" + "=" * 80)

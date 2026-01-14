@@ -1,9 +1,9 @@
 # %% [markdown]
 # # Migration: Hyperparameter Search (XGBoost + Random Search)
-# 
+#
 # ## Overview
 # This script performs hyperparameter optimization using Random Search for XGBoost regression.
-# 
+#
 # ## What We'll Do:
 # 1. Load cleaned training data (sampled for efficiency)
 # 2. Prepare features and target
@@ -12,14 +12,12 @@
 
 # %%
 from snowflake.snowpark.context import get_active_session
-from snowflake.snowpark import functions as F
-import pandas as pd
+from snowflake.ml.feature_store import FeatureStore
 import numpy as np
 from xgboost import XGBRegressor
 from sklearn.model_selection import RandomizedSearchCV, train_test_split
 from sklearn.metrics import mean_squared_error, mean_absolute_error
 from scipy.stats import randint, uniform
-import pickle
 from datetime import datetime
 
 session = get_active_session()
@@ -33,18 +31,50 @@ print(f"   Database: {session.get_current_database()}")
 print(f"   Schema: {session.get_current_schema()}")
 
 # %% [markdown]
-# ## 1. Load and Sample Training Data
+# ## 1. Load Features from Feature Store
 
 # %%
-print("\n" + "="*80)
-print("📊 LOADING TRAINING DATA")
-print("="*80)
+print("\n" + "=" * 80)
+print("🏪 LOADING FEATURES FROM FEATURE STORE")
+print("=" * 80)
 
-# Load cleaned training data
-train_df = session.table("BD_AA_DEV.SC_STORAGE_BMX_PS.TRAIN_DATASET_CLEANED")
+# Initialize Feature Store
+fs = FeatureStore(session=session, database="BD_AA_DEV", name="FEATURE_STORE")
+
+print("✅ Feature Store initialized")
+
+# Get FeatureView
+try:
+    feature_view = fs.get_feature_view("UNI_BOX_FEATURES", version="v1")
+    print("✅ FeatureView 'UNI_BOX_FEATURES' v1 loaded")
+except Exception as e:
+    # Try v2 if v1 doesn't exist
+    try:
+        feature_view = fs.get_feature_view("UNI_BOX_FEATURES", version="v2")
+        print("✅ FeatureView 'UNI_BOX_FEATURES' v2 loaded")
+    except:
+        print(f"❌ Error loading FeatureView: {str(e)}")
+        print("   Please run 02_feature_store_setup.py first")
+        raise
+
+# Materialize features (get the feature data)
+print("\n⏳ Materializing features from Feature Store...")
+features_df = feature_view.get_features()
+
+# Get target from cleaned training table
+print("⏳ Loading target variable from training table...")
+target_df = session.table("BD_AA_DEV.SC_STORAGE_BMX_PS.TRAIN_DATASET_CLEANED").select(
+    "customer_id", "brand_pres_ret", "week", "uni_box_week"
+)
+
+# Join features with target
+print("⏳ Joining features with target...")
+train_df = features_df.join(
+    target_df, on=["customer_id", "brand_pres_ret", "week"], how="inner"
+)
 
 total_rows = train_df.count()
-print(f"\n✅ Training data loaded")
+print(f"\n✅ Training data loaded from Feature Store")
 print(f"   Total rows: {total_rows:,}")
 
 # Sample data for hyperparameter search (5-10% for efficiency)
@@ -64,19 +94,22 @@ print(f"✅ Converted to pandas: {df.shape}")
 # ## 2. Prepare Features and Target
 
 # %%
-print("\n" + "="*80)
+print("\n" + "=" * 80)
 print("🔧 PREPARING FEATURES AND TARGET")
-print("="*80)
+print("=" * 80)
 
-# Define excluded columns
+# Define excluded columns (metadata columns from Feature Store)
 excluded_cols = [
-    'customer_id', 'brand_pres_ret', 'week', 
-    'group', 'stats_group', 'percentile_group', 'stats_ntile_group'
+    "customer_id",
+    "brand_pres_ret",
+    "week",
+    "FEATURE_TIMESTAMP",  # Feature Store timestamp column
 ]
 
 # Get feature columns (all except excluded and target)
-feature_cols = [col for col in df.columns 
-                if col not in excluded_cols + ['uni_box_week']]
+feature_cols = [
+    col for col in df.columns if col not in excluded_cols + ["uni_box_week"]
+]
 
 print(f"\n📋 Features ({len(feature_cols)}):")
 for col in sorted(feature_cols):
@@ -84,7 +117,7 @@ for col in sorted(feature_cols):
 
 # Prepare X and y
 X = df[feature_cols].fillna(0)  # Fill NaN with 0
-y = df['uni_box_week'].fillna(0)
+y = df["uni_box_week"].fillna(0)
 
 print(f"\n✅ Features prepared:")
 print(f"   X shape: {X.shape}")
@@ -93,9 +126,7 @@ print(f"   Target range: [{y.min():.2f}, {y.max():.2f}]")
 print(f"   Target mean: {y.mean():.2f}")
 
 # Split into train and validation sets
-X_train, X_val, y_train, y_val = train_test_split(
-    X, y, test_size=0.2, random_state=42
-)
+X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=42)
 
 print(f"\n📊 Train/Validation split:")
 print(f"   Training: {X_train.shape[0]:,} samples")
@@ -105,28 +136,28 @@ print(f"   Validation: {X_val.shape[0]:,} samples")
 # ## 3. Define Hyperparameter Search Space
 
 # %%
-print("\n" + "="*80)
+print("\n" + "=" * 80)
 print("🎯 DEFINING HYPERPARAMETER SEARCH SPACE")
-print("="*80)
+print("=" * 80)
 
 # Define parameter distributions for Random Search
 param_distributions = {
-    'n_estimators': randint(50, 300),
-    'max_depth': randint(3, 10),
-    'learning_rate': uniform(0.01, 0.3),
-    'subsample': uniform(0.6, 1.0),
-    'colsample_bytree': uniform(0.6, 1.0),
-    'min_child_weight': randint(1, 7),
-    'gamma': uniform(0, 0.5),
-    'reg_alpha': uniform(0, 1),
-    'reg_lambda': uniform(0, 1)
+    "n_estimators": randint(50, 300),
+    "max_depth": randint(3, 10),
+    "learning_rate": uniform(0.01, 0.3),
+    "subsample": uniform(0.6, 1.0),
+    "colsample_bytree": uniform(0.6, 1.0),
+    "min_child_weight": randint(1, 7),
+    "gamma": uniform(0, 0.5),
+    "reg_alpha": uniform(0, 1),
+    "reg_lambda": uniform(0, 1),
 }
 
 print("\n📋 Hyperparameter Search Space:")
 for param, dist in param_distributions.items():
-    if hasattr(dist, 'a') and hasattr(dist, 'b'):
+    if hasattr(dist, "a") and hasattr(dist, "b"):
         print(f"   {param}: uniform({dist.a:.2f}, {dist.b:.2f})")
-    elif hasattr(dist, 'low') and hasattr(dist, 'high'):
+    elif hasattr(dist, "low") and hasattr(dist, "high"):
         print(f"   {param}: randint({dist.low}, {dist.high})")
 
 # Number of iterations for Random Search
@@ -137,16 +168,13 @@ print(f"\n🔢 Random Search iterations: {n_iter}")
 # ## 4. Perform Random Search
 
 # %%
-print("\n" + "="*80)
+print("\n" + "=" * 80)
 print("🔍 PERFORMING RANDOM SEARCH")
-print("="*80)
+print("=" * 80)
 
 # Create base XGBoost model
 base_model = XGBRegressor(
-    random_state=42,
-    n_jobs=-1,
-    objective='reg:squarederror',
-    eval_metric='rmse'
+    random_state=42, n_jobs=-1, objective="reg:squarederror", eval_metric="rmse"
 )
 
 # Create Random Search
@@ -155,10 +183,10 @@ random_search = RandomizedSearchCV(
     param_distributions=param_distributions,
     n_iter=n_iter,
     cv=5,  # 5-fold cross-validation
-    scoring='neg_mean_squared_error',
+    scoring="neg_mean_squared_error",
     n_jobs=-1,
     random_state=42,
-    verbose=1
+    verbose=1,
 )
 
 print("\n⏳ Starting Random Search (this may take several minutes)...")
@@ -167,6 +195,7 @@ print("   This will test 50 different hyperparameter combinations\n")
 
 # Fit Random Search
 import time
+
 start_time = time.time()
 
 random_search.fit(X_train, y_train)
@@ -178,9 +207,9 @@ print(f"\n✅ Random Search completed in {elapsed_time/60:.2f} minutes")
 # ## 5. Evaluate Best Model
 
 # %%
-print("\n" + "="*80)
+print("\n" + "=" * 80)
 print("🏆 BEST HYPERPARAMETERS")
-print("="*80)
+print("=" * 80)
 
 best_params = random_search.best_params_
 best_score = random_search.best_score_
@@ -206,12 +235,13 @@ print(f"   MAE: {val_mae:.4f}")
 # ## 6. Save Hyperparameters
 
 # %%
-print("\n" + "="*80)
+print("\n" + "=" * 80)
 print("💾 SAVING HYPERPARAMETERS")
-print("="*80)
+print("=" * 80)
 
 # Create results table
-session.sql("""
+session.sql(
+    """
     CREATE TABLE IF NOT EXISTS BD_AA_DEV.SC_STORAGE_BMX_PS.HYPERPARAMETER_RESULTS (
         search_id VARCHAR,
         algorithm VARCHAR,
@@ -224,15 +254,21 @@ session.sql("""
         sample_size INTEGER,
         created_at TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
     )
-""").collect()
+"""
+).collect()
 
 # Save results
 search_id = f"xgb_random_search_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
 
 # Convert best_params to JSON string for VARIANT type
 import json
-best_params_json = json.dumps({k: float(v) if isinstance(v, (np.integer, np.floating)) else v 
-                               for k, v in best_params.items()})
+
+best_params_json = json.dumps(
+    {
+        k: float(v) if isinstance(v, (np.integer, np.floating)) else v
+        for k, v in best_params.items()
+    }
+)
 
 insert_sql = f"""
     INSERT INTO BD_AA_DEV.SC_STORAGE_BMX_PS.HYPERPARAMETER_RESULTS
@@ -256,7 +292,8 @@ print(f"✅ Hyperparameters saved to HYPERPARAMETER_RESULTS")
 print(f"   Search ID: {search_id}")
 
 # Verify save
-saved_results = session.sql(f"""
+saved_results = session.sql(
+    f"""
     SELECT 
         search_id,
         algorithm,
@@ -266,7 +303,8 @@ saved_results = session.sql(f"""
         created_at
     FROM BD_AA_DEV.SC_STORAGE_BMX_PS.HYPERPARAMETER_RESULTS
     WHERE search_id = '{search_id}'
-""")
+"""
+)
 
 print("\n📊 Saved Results:")
 saved_results.show()
@@ -275,9 +313,9 @@ saved_results.show()
 # ## 7. Summary
 
 # %%
-print("\n" + "="*80)
+print("\n" + "=" * 80)
 print("✅ HYPERPARAMETER SEARCH COMPLETE!")
-print("="*80)
+print("=" * 80)
 
 print("\n📋 Summary:")
 print(f"   ✅ Algorithm: XGBoost")
@@ -293,4 +331,4 @@ print("   1. Review best hyperparameters")
 print("   2. Run 04_many_model_training.py to train model with best hyperparameters")
 print("   3. Use full dataset for final training")
 
-print("\n" + "="*80)
+print("\n" + "=" * 80)

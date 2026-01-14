@@ -14,6 +14,7 @@
 # %%
 from snowflake.snowpark.context import get_active_session
 from snowflake.ml.registry import Registry
+from snowflake.ml.feature_store import FeatureStore
 from snowflake.snowpark import functions as F
 import pandas as pd
 import time
@@ -59,22 +60,63 @@ for f in functions:
     print(f"   - {f['name']}")
 
 # %% [markdown]
-# ## 2. Load Inference Data
+# ## 2. Load Inference Data from Feature Store
 
 # %%
 print("\n" + "="*80)
-print("📊 LOADING INFERENCE DATA")
+print("🏪 LOADING FEATURES FROM FEATURE STORE")
 print("="*80)
 
-# Load cleaned inference data
-inference_df = session.table("BD_AA_DEV.SC_STORAGE_BMX_PS.INFERENCE_DATASET_CLEANED")
+# Initialize Feature Store
+fs = FeatureStore(
+    session=session,
+    database="BD_AA_DEV",
+    name="FEATURE_STORE"
+)
 
-print(f"\n✅ Inference data loaded")
+print("✅ Feature Store initialized")
+
+# Get FeatureView
+try:
+    feature_view = fs.get_feature_view("UNI_BOX_FEATURES", version="v1")
+    print("✅ FeatureView 'UNI_BOX_FEATURES' v1 loaded")
+except Exception as e:
+    # Try v2 if v1 doesn't exist
+    try:
+        feature_view = fs.get_feature_view("UNI_BOX_FEATURES", version="v2")
+        print("✅ FeatureView 'UNI_BOX_FEATURES' v2 loaded")
+    except:
+        print(f"❌ Error loading FeatureView: {str(e)}")
+        print("   Please run 02_feature_store_setup.py first")
+        raise
+
+# Get inference entity keys (customer_id, brand_pres_ret, week) from inference table
+# This will be our "spine" - the entities we want features for
+print("\n⏳ Loading inference entity keys (spine)...")
+inference_spine = session.table("BD_AA_DEV.SC_STORAGE_BMX_PS.INFERENCE_DATASET_CLEANED").select(
+    "customer_id", "brand_pres_ret", "week"
+).distinct()
+
+print(f"   Unique inference keys: {inference_spine.count():,}")
+
+# Materialize all features from FeatureView
+print("⏳ Materializing features from Feature Store...")
+all_features_df = feature_view.get_features()
+
+# Join spine with features to get only features for inference entities
+print("⏳ Joining spine with features...")
+inference_df = inference_spine.join(
+    all_features_df,
+    on=["customer_id", "brand_pres_ret", "week"],
+    how="inner"
+)
+
+print(f"\n✅ Inference features loaded from Feature Store")
 print(f"   Total records: {inference_df.count():,}")
 print(f"   Unique customers: {inference_df.select('customer_id').distinct().count():,}")
 
 # Show sample
-print("\n📋 Sample inference data:")
+print("\n📋 Sample inference features:")
 inference_df.select(
     'customer_id', 'week', 'brand_pres_ret', 
     'sum_past_12_weeks', 'week_of_year'
@@ -88,10 +130,10 @@ print("\n" + "="*80)
 print("🔧 PREPARING INFERENCE INPUT")
 print("="*80)
 
-# Define excluded columns
+# Define excluded columns (metadata columns from Feature Store)
 excluded_cols = [
     'customer_id', 'brand_pres_ret', 'week', 
-    'group', 'stats_group', 'percentile_group', 'stats_ntile_group'
+    'FEATURE_TIMESTAMP'  # Feature Store timestamp column
 ]
 
 # Get feature columns (same as training)

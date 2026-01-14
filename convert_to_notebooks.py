@@ -1,6 +1,5 @@
 import json
 import os
-import re
 import uuid
 
 def convert_py_to_notebook(py_file_path, output_notebook_path):
