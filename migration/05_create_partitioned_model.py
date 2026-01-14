@@ -23,7 +23,6 @@ from datetime import datetime
 session = get_active_session()
 
 # Set context
-session.sql("USE WAREHOUSE ARCA_DEMO_WH").collect()
 session.sql("USE DATABASE BD_AA_DEV").collect()
 session.sql("USE SCHEMA SC_STORAGE_BMX_PS").collect()
 

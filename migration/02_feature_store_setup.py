@@ -13,13 +13,10 @@
 # %%
 from snowflake.snowpark.context import get_active_session
 from snowflake.ml.feature_store import FeatureStore, Entity, FeatureView, CreationMode
-from snowflake.snowpark import functions as F
-from datetime import datetime
 
 session = get_active_session()
 
 # Set context
-session.sql("USE WAREHOUSE ARCA_DEMO_WH").collect()
 session.sql("USE DATABASE BD_AA_DEV").collect()
 session.sql("USE SCHEMA SC_STORAGE_BMX_PS").collect()
 
@@ -46,7 +43,6 @@ fs = FeatureStore(
     session=session,
     database="BD_AA_DEV",
     name="FEATURE_STORE",
-    default_warehouse="ARCA_DEMO_WH",
     creation_mode=CreationMode.CREATE_IF_NOT_EXIST
 )
 
