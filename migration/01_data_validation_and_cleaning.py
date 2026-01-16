@@ -284,7 +284,85 @@ cleaned_inference_count = session.table(
 print(f"✅ Cleaned inference table created: {cleaned_inference_count:,} rows")
 
 # %% [markdown]
-# ## 7. Summary Statistics
+# ## 7. Validate stats_ntile_group Segmentation
+
+# %%
+print("\n" + "=" * 80)
+print("🔍 VALIDATING stats_ntile_group SEGMENTATION")
+print("=" * 80)
+
+# Check if stats_ntile_group exists
+if "stats_ntile_group" not in columns_lower:
+    print("\n❌ ERROR: Column 'stats_ntile_group' NOT found in training dataset!")
+    print("   This column is required for 16-group model training.")
+    raise ValueError("stats_ntile_group column is required")
+
+# Find actual column name (preserving case)
+stats_ntile_col = columns[columns_lower.index("stats_ntile_group")]
+
+# Get unique groups
+groups_df = session.sql(
+    f"""
+    SELECT 
+        {stats_ntile_col} AS GROUP_NAME,
+        COUNT(*) AS RECORD_COUNT,
+        COUNT(DISTINCT customer_id) AS UNIQUE_CUSTOMERS,
+        AVG(uni_box_week) AS AVG_TARGET,
+        MIN(uni_box_week) AS MIN_TARGET,
+        MAX(uni_box_week) AS MAX_TARGET
+    FROM BD_AA_DEV.SC_STORAGE_BMX_PS.TRAIN_DATASET_CLEANED
+    WHERE {stats_ntile_col} IS NOT NULL
+    GROUP BY {stats_ntile_col}
+    ORDER BY {stats_ntile_col}
+"""
+)
+
+print("\n📊 Group Distribution:")
+groups_df.show()
+
+# Get group count
+group_count = groups_df.count()
+print(f"\n📊 Total unique groups: {group_count}")
+
+# Validate we have exactly 16 groups
+if group_count != 16:
+    print(f"\n⚠️  WARNING: Expected 16 groups, found {group_count}")
+    print("   This may affect model training. Please verify segmentation logic.")
+else:
+    print(f"\n✅ Validation passed: Exactly 16 groups found")
+
+# Check minimum records per group (recommend at least 100)
+min_records_check = session.sql(
+    f"""
+    SELECT 
+        MIN(RECORD_COUNT) AS MIN_RECORDS,
+        MAX(RECORD_COUNT) AS MAX_RECORDS,
+        AVG(RECORD_COUNT) AS AVG_RECORDS
+    FROM (
+        SELECT 
+            {stats_ntile_col},
+            COUNT(*) AS RECORD_COUNT
+        FROM BD_AA_DEV.SC_STORAGE_BMX_PS.TRAIN_DATASET_CLEANED
+        WHERE {stats_ntile_col} IS NOT NULL
+        GROUP BY {stats_ntile_col}
+    )
+"""
+)
+
+print("\n📊 Records per Group Statistics:")
+min_records_check.show()
+
+min_records_result = min_records_check.collect()[0]
+min_records = min_records_result["MIN_RECORDS"]
+
+if min_records < 100:
+    print(f"\n⚠️  WARNING: Some groups have less than 100 records (minimum: {min_records})")
+    print("   This may affect model training quality.")
+else:
+    print(f"\n✅ All groups have sufficient data (minimum: {min_records} records)")
+
+# %% [markdown]
+# ## 8. Summary Statistics
 
 # %%
 print("\n" + "=" * 80)
@@ -329,6 +407,14 @@ summary.show()
 print("\n" + "=" * 80)
 print("✅ DATA VALIDATION AND CLEANING COMPLETE!")
 print("=" * 80)
+
+print("\n📋 Validation Summary:")
+print(f"   ✅ Training data validated: {cleaned_train_count:,} rows")
+print(f"   ✅ Inference data validated: {cleaned_inference_count:,} rows")
+print(f"   ✅ stats_ntile_group validated: {group_count} groups")
+print(f"   ✅ Minimum records per group: {min_records}")
+
 print("\n📋 Next Steps:")
-print("   1. Review cleaned tables")
+print("   1. Review cleaned tables and group distribution")
 print("   2. Run 02_feature_store_setup.py to create Feature Store")
+print("   3. Run 03_hyperparameter_search.py to find optimal hyperparameters per group")

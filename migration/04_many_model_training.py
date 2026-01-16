@@ -1,15 +1,16 @@
 # %% [markdown]
-# # Migration: Many Model Training (MMT) - XGBoost
+# # Migration: Many Model Training (MMT) - XGBoost (16 Models)
 #
 # ## Overview
-# This script trains a single XGBoost model using Many Model Training (MMT) framework.
-# Even though we have one model, we use MMT for consistency and future scalability.
+# This script trains **16 XGBoost models** (one per stats_ntile_group) using Many Model Training (MMT) framework.
+# Each model is trained with group-specific hyperparameters and data.
 #
 # ## What We'll Do:
-# 1. Load best hyperparameters from hyperparameter search
-# 2. Define training function for MMT
-# 3. Execute MMT training with full dataset
-# 4. Register model in Model Registry
+# 1. Load best hyperparameters per group from hyperparameter search
+# 2. Define training function for MMT (with group-specific hyperparameters)
+# 3. Execute MMT training with partition_by="stats_ntile_group"
+# 4. Register 16 models in Model Registry (one per group)
+# 5. Create group-to-model mapping
 
 # %%
 from snowflake.snowpark.context import get_active_session
@@ -46,56 +47,113 @@ print("✅ Model Registry initialized")
 print("✅ Stage for MMT models created")
 
 # %% [markdown]
-# ## 2. Load Best Hyperparameters
+# ## 2. Load Best Hyperparameters Per Group
 
 # %%
 print("\n" + "=" * 80)
-print("📊 LOADING BEST HYPERPARAMETERS")
+print("📊 LOADING BEST HYPERPARAMETERS PER GROUP")
 print("=" * 80)
 
-# Get most recent hyperparameter search results
+# Get most recent hyperparameter search results per group
 hyperparams_df = session.sql(
     """
+    WITH latest_searches AS (
+        SELECT 
+            group_name,
+            search_id,
+            algorithm,
+            best_params,
+            best_cv_rmse,
+            val_rmse,
+            val_mae,
+            created_at,
+            ROW_NUMBER() OVER (PARTITION BY group_name ORDER BY created_at DESC) AS rn
+        FROM BD_AA_DEV.SC_STORAGE_BMX_PS.HYPERPARAMETER_RESULTS
+        WHERE algorithm = 'XGBoost'
+            AND group_name IS NOT NULL
+    )
     SELECT 
+        group_name,
         search_id,
-        algorithm,
         best_params,
         best_cv_rmse,
         val_rmse,
-        val_mae,
-        created_at
-    FROM BD_AA_DEV.SC_STORAGE_BMX_PS.HYPERPARAMETER_RESULTS
-    WHERE algorithm = 'XGBoost'
-    ORDER BY created_at DESC
-    LIMIT 1
+        val_mae
+    FROM latest_searches
+    WHERE rn = 1
+    ORDER BY group_name
 """
 )
 
-hyperparams_result = hyperparams_df.collect()
+hyperparams_results = hyperparams_df.collect()
 
-if len(hyperparams_result) == 0:
+if len(hyperparams_results) == 0:
     raise ValueError(
         "No hyperparameter results found! Please run 03_hyperparameter_search.py first"
     )
 
-best_result = hyperparams_result[0]
-best_params_json = best_result["BEST_PARAMS"]
-search_id = best_result["SEARCH_ID"]
+print(f"\n✅ Loaded hyperparameters for {len(hyperparams_results)} groups")
 
-print(f"\n✅ Best hyperparameters loaded")
-print(f"   Search ID: {search_id}")
-print(f"   Best CV RMSE: {best_result['BEST_CV_RMSE']:.4f}")
-print(f"   Validation RMSE: {best_result['VAL_RMSE']:.4f}")
+# Create dictionary: group_name -> hyperparameters
+hyperparams_by_group = {}
+for result in hyperparams_results:
+    group_name = result["GROUP_NAME"]
+    best_params_json = result["BEST_PARAMS"]
+    
+    # Parse hyperparameters
+    if isinstance(best_params_json, str):
+        best_params = json.loads(best_params_json)
+    else:
+        best_params = best_params_json
+    
+    hyperparams_by_group[group_name] = {
+        "params": best_params,
+        "val_rmse": result["VAL_RMSE"],
+        "search_id": result["SEARCH_ID"],
+    }
+    
+    print(f"\n   {group_name}:")
+    print(f"      Val RMSE: {result['VAL_RMSE']:.4f}")
+    print(f"      Search ID: {result['SEARCH_ID']}")
 
-# Parse hyperparameters
-if isinstance(best_params_json, str):
-    best_params = json.loads(best_params_json)
-else:
-    best_params = best_params_json
+# Get default hyperparameters (for groups without search results)
+default_params = {
+    "n_estimators": 100,
+    "max_depth": 6,
+    "learning_rate": 0.1,
+    "subsample": 0.8,
+    "colsample_bytree": 0.8,
+    "min_child_weight": 1,
+    "gamma": 0,
+    "reg_alpha": 0,
+    "reg_lambda": 1,
+}
 
-print(f"\n📋 Best Hyperparameters:")
-for param, value in sorted(best_params.items()):
+print(f"\n📋 Default hyperparameters (for groups without search results):")
+for param, value in sorted(default_params.items()):
     print(f"   {param}: {value}")
+
+# Validate that we have hyperparameters for all expected groups
+print(f"\n🔍 Validating hyperparameter coverage...")
+all_groups_from_data = session.sql(
+    """
+    SELECT DISTINCT stats_ntile_group
+    FROM BD_AA_DEV.SC_STORAGE_BMX_PS.TRAIN_DATASET_CLEANED
+    WHERE stats_ntile_group IS NOT NULL
+    ORDER BY stats_ntile_group
+"""
+).collect()
+
+expected_groups = [row["STATS_NTILE_GROUP"] for row in all_groups_from_data]
+groups_with_hyperparams = set(hyperparams_by_group.keys())
+groups_without_hyperparams = set(expected_groups) - groups_with_hyperparams
+
+if groups_without_hyperparams:
+    print(f"⚠️  WARNING: {len(groups_without_hyperparams)} groups will use default hyperparameters:")
+    for group in sorted(groups_without_hyperparams):
+        print(f"      - {group}")
+else:
+    print(f"✅ All {len(expected_groups)} groups have optimized hyperparameters!")
 
 # %% [markdown]
 # ## 3. Prepare Training Data from Feature Store
@@ -128,10 +186,10 @@ except Exception as e:
 print("\n⏳ Materializing features from Feature Store...")
 features_df = feature_view.get_features()
 
-# Get target from cleaned training table
-print("⏳ Loading target variable from training table...")
+# Get target and stats_ntile_group from cleaned training table
+print("⏳ Loading target variable and stats_ntile_group from training table...")
 target_df = session.table("BD_AA_DEV.SC_STORAGE_BMX_PS.TRAIN_DATASET_CLEANED").select(
-    "customer_id", "brand_pres_ret", "week", "uni_box_week"
+    "customer_id", "brand_pres_ret", "week", "uni_box_week", "stats_ntile_group"
 )
 
 # Join features with target
@@ -144,6 +202,11 @@ print(f"\n✅ Training data loaded from Feature Store")
 print(f"   Total records: {training_df.count():,}")
 print(f"   Columns: {len(training_df.columns)}")
 
+# Show distribution by group
+print("\n📊 Records per Group:")
+group_counts = training_df.group_by("stats_ntile_group").count().sort("stats_ntile_group")
+group_counts.show()
+
 # %% [markdown]
 # ## 4. Define Training Function for MMT
 
@@ -153,33 +216,32 @@ print("🔧 DEFINING TRAINING FUNCTION")
 print("=" * 80)
 
 
-def train_model(data_connector, context):
+def train_segment_model(data_connector, context):
     """
-    Train XGBoost model for uni_box_week regression.
+    Train XGBoost model for uni_box_week regression for a specific group.
 
     This function:
-    1. Receives data via MMT data connector
-    2. Loads best hyperparameters
+    1. Receives data for ONE group (via MMT partitioning)
+    2. Loads group-specific hyperparameters
     3. Trains XGBoost model
     4. Evaluates on test set
     5. Returns trained model
 
     Args:
         data_connector: Snowflake data connector (provided by MMT)
-        context: Contains partition_id (if partitioned)
+        context: Contains partition_id (stats_ntile_group name)
 
     Returns:
         Trained XGBoost model object
     """
-    import pandas as pd
     from xgboost import XGBRegressor
     from sklearn.model_selection import train_test_split
     from sklearn.metrics import mean_squared_error, mean_absolute_error
     import numpy as np
-    import json
 
+    segment_name = context.partition_id
     print(f"\n{'='*80}")
-    print(f"🚀 Training XGBoost model")
+    print(f"🚀 Training model for {segment_name}")
     print(f"{'='*80}")
 
     # Load data
@@ -192,6 +254,7 @@ def train_model(data_connector, context):
         "brand_pres_ret",
         "week",
         "FEATURE_TIMESTAMP",  # Feature Store timestamp column
+        "stats_ntile_group",  # Group column - not a feature
     ]
 
     # Get feature columns
@@ -206,6 +269,7 @@ def train_model(data_connector, context):
 
     print(f"   Features: {len(feature_cols)}")
     print(f"   Target range: [{y.min():.2f}, {y.max():.2f}]")
+    print(f"   Target mean: {y.mean():.2f}")
 
     # Split train/test
     X_train, X_test, y_train, y_test = train_test_split(
@@ -215,21 +279,24 @@ def train_model(data_connector, context):
     print(f"   Training set: {X_train.shape[0]:,} samples")
     print(f"   Test set: {X_test.shape[0]:,} samples")
 
-    # Load best hyperparameters
-    # Get from context or use default
-    try:
-        # Try to get hyperparameters from context
-        if hasattr(context, "hyperparameters"):
-            params = context.hyperparameters
-        else:
-            # Load from table (this is a workaround - in practice, pass via context)
-            params = best_params
-    except:
-        params = best_params
+    # Get group-specific hyperparameters
+    # IMPORTANT: This uses hyperparams_by_group loaded from script 03
+    if segment_name in hyperparams_by_group:
+        group_params = hyperparams_by_group[segment_name]["params"]
+        search_id = hyperparams_by_group[segment_name]["search_id"]
+        val_rmse = hyperparams_by_group[segment_name]["val_rmse"]
+        print(f"\n   ✅ Using OPTIMIZED hyperparameters from script 03")
+        print(f"      Search ID: {search_id}")
+        print(f"      Validation RMSE (from search): {val_rmse:.4f}")
+        print(f"      Hyperparameters: {', '.join([f'{k}={v:.3f}' if isinstance(v, float) else f'{k}={v}' for k, v in sorted(group_params.items())[:5]])}...")
+    else:
+        group_params = default_params
+        print(f"\n   ⚠️  Using DEFAULT hyperparameters (no search results found for {segment_name})")
+        print(f"      This group was not processed in script 03 or had insufficient data")
 
     # Convert hyperparameters to proper types
     xgb_params = {}
-    for k, v in params.items():
+    for k, v in group_params.items():
         if isinstance(v, (int, float)):
             xgb_params[k] = v
         elif isinstance(v, (np.integer, np.floating)):
@@ -243,7 +310,7 @@ def train_model(data_connector, context):
     xgb_params["objective"] = "reg:squarederror"
     xgb_params["eval_metric"] = "rmse"
 
-    print(f"\n   Training XGBoost with hyperparameters...")
+    print(f"\n   Training XGBoost with {len(xgb_params)} hyperparameters...")
 
     # Train model
     model = XGBRegressor(**xgb_params)
@@ -266,6 +333,8 @@ def train_model(data_connector, context):
     model.test_samples = X_test.shape[0]
     model.feature_cols = feature_cols
     model.hyperparameters = xgb_params
+    model.segment = segment_name
+    model.group_name = segment_name
 
     return model
 
@@ -273,22 +342,25 @@ def train_model(data_connector, context):
 print("✅ Training function defined")
 
 # %% [markdown]
-# ## 5. Execute Many Model Training (MMT)
+# ## 5. Execute Many Model Training (MMT) - 16 Models
 
 # %%
 print("\n" + "=" * 80)
-print("🚀 STARTING MANY MODEL TRAINING (MMT)")
+print("🚀 STARTING MANY MODEL TRAINING (MMT) - 16 MODELS")
 print("=" * 80)
-print("\nTraining XGBoost model using MMT framework")
-print("Using best hyperparameters from Random Search\n")
+print("\nTraining 16 XGBoost models in PARALLEL (one per stats_ntile_group)")
+print("Each model uses group-specific hyperparameters\n")
 
 start_time = time.time()
 
 # Create MMT trainer
-trainer = ManyModelTraining(train_model, "BD_AA_DEV.MODEL_REGISTRY.MMT_MODELS")
+trainer = ManyModelTraining(
+    train_segment_model, "BD_AA_DEV.MODEL_REGISTRY.MMT_MODELS"
+)
 
-# Execute training (without partition_by for single model)
+# Execute training with partition_by stats_ntile_group
 training_run = trainer.run(
+    partition_by="stats_ntile_group",  # ← KEY: Partition by group
     snowpark_dataframe=training_df,
     run_id=f"uni_box_regression_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
 )
@@ -389,25 +461,37 @@ for partition_id in training_run.partition_details:
         try:
             model = training_run.get_model(partition_id)
 
-            model_name = "uni_box_regression_model"
+            # Model name includes group identifier
+            model_name = f"uni_box_regression_{partition_id.lower()}"
 
-            # Prepare sample input
-            sample_input = training_df.select(model.feature_cols).limit(5)
+            # Get group-specific search ID if available
+            group_search_id = None
+            if partition_id in hyperparams_by_group:
+                group_search_id = hyperparams_by_group[partition_id]["search_id"]
 
-            print(f"\nRegistering model...")
+            # Prepare sample input from this group
+            sample_input = (
+                training_df.filter(training_df["stats_ntile_group"] == partition_id)
+                .select(model.feature_cols)
+                .limit(5)
+            )
+
+            print(f"\nRegistering {partition_id}...")
 
             mv = registry.log_model(
                 model,
                 model_name=model_name,
                 version_name=f"v_{version_date}",
-                comment=f"XGBoost regression model for uni_box_week - Hyperparameters from {search_id}",
+                comment=f"XGBoost regression model for uni_box_week - Group: {partition_id}",
                 metrics={
                     "rmse": float(model.rmse),
                     "mae": float(model.mae),
                     "training_samples": int(model.training_samples),
                     "test_samples": int(model.test_samples),
                     "algorithm": "XGBoost",
-                    "hyperparameter_search_id": search_id,
+                    "group": partition_id,
+                    "hyperparameter_search_id": group_search_id or "default",
+                    "hyperparameter_source": getattr(model, "hyperparameter_source", "unknown"),
                 },
                 sample_input_data=sample_input,
                 task=task.Task.TABULAR_REGRESSION,
@@ -419,7 +503,7 @@ for partition_id in training_run.partition_details:
                 "model_version": mv,
             }
 
-            print(f"✅ Model registered: {model_name} v_{version_date}")
+            print(f"✅ {partition_id}: {model_name} v_{version_date}")
             print(f"   RMSE: {model.rmse:.2f}, MAE: {model.mae:.2f}")
 
         except Exception as e:
@@ -463,22 +547,20 @@ print("🎉 MANY MODEL TRAINING (MMT) COMPLETE!")
 print("=" * 80)
 
 print("\n📊 Summary:")
-print(f"   ✅ Models trained: {len(registered_models)}")
+print(f"   ✅ Models trained: {len(registered_models)}/16")
 print(f"   ⏱️  Training time: {elapsed_minutes:.2f} minutes")
 print(f"   🔧 Algorithm: XGBoost")
-print(f"   📈 Hyperparameters: From {search_id}")
+print(f"   📈 Hyperparameters: Group-specific (from hyperparameter search)")
 
 if registered_models:
-    for partition_id, info in registered_models.items():
+    print(f"\n🏆 Model Performance by Group:")
+    for partition_id in sorted(registered_models.keys()):
         model = training_run.get_model(partition_id)
-        print(f"\n🏆 Model Performance:")
-        print(f"   RMSE: {model.rmse:.2f}")
-        print(f"   MAE: {model.mae:.2f}")
-        print(f"   Training samples: {model.training_samples:,}")
+        print(f"   {partition_id}: RMSE={model.rmse:.2f}, MAE={model.mae:.2f}, Samples={model.training_samples:,}")
 
 print("\n💡 Next Steps:")
-print("   1. Review model performance")
-print("   2. Run 05_create_partitioned_model.py to create partitioned model")
-print("   3. Run 06_partitioned_inference_batch.py for batch inference")
+print("   1. Review model performance by group")
+print("   2. Run 05_create_partitioned_model.py to create partitioned model (combines all 16)")
+print("   3. Run 06_partitioned_inference_batch.py for batch inference with automatic routing")
 
 print("\n" + "=" * 80)

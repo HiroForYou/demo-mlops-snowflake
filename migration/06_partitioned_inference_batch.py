@@ -90,14 +90,23 @@ except Exception as e:
         print("   Please run 02_feature_store_setup.py first")
         raise
 
-# Get inference entity keys (customer_id, brand_pres_ret, week) from inference table
+# Get inference entity keys (customer_id, brand_pres_ret, week) and stats_ntile_group from inference table
 # This will be our "spine" - the entities we want features for
-print("\n⏳ Loading inference entity keys (spine)...")
+print("\n⏳ Loading inference entity keys (spine) with stats_ntile_group...")
 inference_spine = session.table("BD_AA_DEV.SC_STORAGE_BMX_PS.INFERENCE_DATASET_CLEANED").select(
-    "customer_id", "brand_pres_ret", "week"
+    "customer_id", "brand_pres_ret", "week", "stats_ntile_group"
 ).distinct()
 
 print(f"   Unique inference keys: {inference_spine.count():,}")
+
+# Verify stats_ntile_group exists
+if "stats_ntile_group" not in inference_spine.columns:
+    raise ValueError("stats_ntile_group column not found in inference dataset! This is required for partitioned inference.")
+
+# Check group distribution
+print("\n📊 Inference records per group:")
+group_dist = inference_spine.group_by("stats_ntile_group").count().sort("stats_ntile_group")
+group_dist.show()
 
 # Materialize all features from FeatureView
 print("⏳ Materializing features from Feature Store...")
@@ -118,7 +127,7 @@ print(f"   Unique customers: {inference_df.select('customer_id').distinct().coun
 # Show sample
 print("\n📋 Sample inference features:")
 inference_df.select(
-    'customer_id', 'week', 'brand_pres_ret', 
+    'customer_id', 'week', 'brand_pres_ret', 'stats_ntile_group',
     'sum_past_12_weeks', 'week_of_year'
 ).show(5)
 
@@ -145,17 +154,17 @@ print(f"\n📋 Features for inference ({len(feature_cols)}):")
 for col in sorted(feature_cols):
     print(f"   - {col}")
 
-# Create a dummy partition column for partitioned inference
-# Since we have a single model, we can use a constant partition
-inference_input = inference_df.with_column("dummy_partition", F.lit("ALL"))
-
+# Use stats_ntile_group as partition column (no dummy needed!)
 # Save to temporary table for inference
+inference_input = inference_df
+
 inference_input.write.mode('overwrite').save_as_table(
     'BD_AA_DEV.SC_STORAGE_BMX_PS.INFERENCE_INPUT_TEMP'
 )
 
 print(f"\n✅ Inference input prepared and saved to temporary table")
 print(f"   Records: {inference_input.count():,}")
+print(f"   Partition column: stats_ntile_group")
 
 # %% [markdown]
 # ## 4. Execute Partitioned Inference
@@ -166,8 +175,8 @@ print("🚀 EXECUTING PARTITIONED INFERENCE")
 print("="*80)
 
 print("\n📝 Running partitioned inference...")
-print("   Syntax: TABLE(model!PREDICT(...) OVER (PARTITION BY dummy_partition))")
-print("   This enables partitioned inference even with a single model\n")
+print("   Syntax: TABLE(model!PREDICT(...) OVER (PARTITION BY stats_ntile_group))")
+print("   This routes each group to its specific trained model automatically\n")
 
 start_time = time.time()
 
@@ -179,24 +188,27 @@ predictions_sql = f"""
 WITH model_predictions AS (
     SELECT 
         p.customer_id,
+        p.stats_ntile_group,
         p.predicted_uni_box_week
     FROM BD_AA_DEV.SC_STORAGE_BMX_PS.INFERENCE_INPUT_TEMP i,
         TABLE(
             BD_AA_DEV.MODEL_REGISTRY.UNI_BOX_REGRESSION_PARTITIONED!PREDICT(
                 i.customer_id,
                 {feature_list}
-            ) OVER (PARTITION BY i.dummy_partition)
+            ) OVER (PARTITION BY i.stats_ntile_group)
         ) p
 )
 SELECT 
     mp.customer_id,
+    mp.stats_ntile_group,
     i.week,
     i.brand_pres_ret,
     ROUND(mp.predicted_uni_box_week, 2) AS predicted_uni_box_week
 FROM model_predictions mp
 JOIN BD_AA_DEV.SC_STORAGE_BMX_PS.INFERENCE_INPUT_TEMP i 
-    ON mp.customer_id = i.customer_id
-ORDER BY mp.customer_id
+    ON mp.customer_id = i.customer_id 
+    AND mp.stats_ntile_group = i.stats_ntile_group
+ORDER BY mp.stats_ntile_group, mp.customer_id
 """
 
 predictions_df = session.sql(predictions_sql)
@@ -254,7 +266,7 @@ WITH model_predictions AS (
                 i.sum_past_4_weeks,
                 i.avg_past_4_weeks,
                 i.max_past_12_weeks
-            ) OVER (PARTITION BY i.dummy_partition)
+            ) OVER (PARTITION BY i.stats_ntile_group)
         ) p
 )
 SELECT
@@ -287,6 +299,7 @@ session.sql("""
         customer_id VARCHAR,
         week VARCHAR,
         brand_pres_ret VARCHAR,
+        stats_ntile_group VARCHAR,
         predicted_uni_box_week FLOAT,
         inference_timestamp TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
         model_version VARCHAR
@@ -299,28 +312,31 @@ session.sql("""
 # Insert predictions
 insert_sql = f"""
 INSERT INTO BD_AA_DEV.SC_STORAGE_BMX_PS.INFERENCE_LOGS
-    (customer_id, week, brand_pres_ret, predicted_uni_box_week, model_version)
+    (customer_id, week, brand_pres_ret, stats_ntile_group, predicted_uni_box_week, model_version)
 WITH model_predictions AS (
     SELECT 
         p.customer_id,
+        p.stats_ntile_group,
         p.predicted_uni_box_week
     FROM BD_AA_DEV.SC_STORAGE_BMX_PS.INFERENCE_INPUT_TEMP i,
         TABLE(
             BD_AA_DEV.MODEL_REGISTRY.UNI_BOX_REGRESSION_PARTITIONED!PREDICT(
                 i.customer_id,
                 {feature_list}
-            ) OVER (PARTITION BY i.dummy_partition)
+            ) OVER (PARTITION BY i.stats_ntile_group)
         ) p
 )
 SELECT 
     mp.customer_id,
     i.week,
     i.brand_pres_ret,
+    mp.stats_ntile_group,
     mp.predicted_uni_box_week,
     '{model_version.version_name}'
 FROM model_predictions mp
 JOIN BD_AA_DEV.SC_STORAGE_BMX_PS.INFERENCE_INPUT_TEMP i 
-    ON mp.customer_id = i.customer_id
+    ON mp.customer_id = i.customer_id 
+    AND mp.stats_ntile_group = i.stats_ntile_group
 """
 
 session.sql(insert_sql).collect()
@@ -351,9 +367,9 @@ print(f"""
    ✅ Model version: {model_version.version_name}
 
 💡 Key Advantages of Partitioned Model:
-   ✅ Single model with partitioned API
-   ✅ Consistent inference syntax
-   ✅ Ready for future multi-model scenarios
+   ✅ 16 group-specific models combined into one
+   ✅ Automatic routing by stats_ntile_group
+   ✅ Each group uses optimized hyperparameters
    ✅ SQL-native inference (no Python required)
    ✅ Parallel execution handled by Snowflake
 

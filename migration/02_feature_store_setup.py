@@ -86,50 +86,46 @@ excluded_cols = [
     "stats_group",
     "percentile_group",
     "stats_ntile_group",
+    "uni_box_week",  # Target variable - not a feature
 ]
 
-# Create FeatureView query
-# This selects all features (excluding excluded columns and target) from cleaned training data
-feature_df = session.sql(
+# Get column names efficiently using DESCRIBE TABLE (more efficient than loading full table)
+print("\n⏳ Getting column names from table schema...")
+columns_info = session.sql(
     """
+    DESCRIBE TABLE BD_AA_DEV.SC_STORAGE_BMX_PS.TRAIN_DATASET_CLEANED
+"""
+).collect()
+
+all_columns = [row["name"] for row in columns_info]
+
+# Get feature columns (all columns except excluded and target)
+excluded_cols_upper = [ex.upper() for ex in excluded_cols]
+feature_columns = [
+    col for col in all_columns 
+    if col.upper() not in excluded_cols_upper
+]
+
+print(f"\n📋 Column Analysis:")
+print(f"   Total columns: {len(all_columns)}")
+print(f"   Excluded columns: {len(excluded_cols)}")
+print(f"   Feature columns: {len(feature_columns)}")
+
+print(f"\n📋 Excluded columns (not features):")
+for col in excluded_cols:
+    print(f"   - {col}")
+
+# Create FeatureView query
+# Dynamically select all feature columns (excluding excluded columns and target)
+feature_cols_str = ",\n        ".join(feature_columns)
+
+feature_df = session.sql(
+    f"""
     SELECT
         customer_id,
         brand_pres_ret,
         week,
-        -- Temporal features
-        week_of_year,
-        -- Past sales features
-        sum_past_12_weeks,
-        avg_past_12_weeks,
-        max_past_12_weeks,
-        sum_past_24_weeks,
-        avg_past_24_weeks,
-        max_past_24_weeks,
-        sum_past_4_weeks,
-        avg_past_4_weeks,
-        max_past_4_weeks,
-        sum_p4w,
-        -- Previous period features
-        max_prev2,
-        avg_prev2,
-        max_prev3,
-        avg_prev3,
-        -- Weekly totals
-        w_m1_total,
-        w_m2_total,
-        w_m3_total,
-        w_m4_total,
-        -- Store features
-        num_coolers,
-        num_doors,
-        -- Category features
-        pharm_super_conv,
-        wines_liquor,
-        groceries,
-        spec_foods,
-        -- Other features
-        avg_avg_daily_all_hours,
-        prod_key,
+        {feature_cols_str},
         -- Timestamp for Feature Store
         CASE 
             WHEN week IS NOT NULL THEN 
@@ -223,9 +219,11 @@ print("\n📋 Summary:")
 print(f"   ✅ Feature Store: BD_AA_DEV.FEATURE_STORE")
 print(f"   ✅ Entity: CUSTOMER_PRODUCT")
 print(f"   ✅ FeatureView: UNI_BOX_FEATURES (v1)")
-print(
-    f"   ✅ Features: {len([col for col in feature_df.columns if col not in ['customer_id', 'brand_pres_ret', 'week', 'FEATURE_TIMESTAMP']])} features"
-)
+# Count actual feature columns (excluding metadata columns)
+metadata_cols = ['customer_id', 'brand_pres_ret', 'week', 'FEATURE_TIMESTAMP']
+actual_feature_count = len([col for col in feature_df.columns if col.upper() not in [m.upper() for m in metadata_cols]])
+print(f"   ✅ Features: {actual_feature_count} features")
+print(f"   ✅ Excluded from features: {', '.join(excluded_cols)}")
 print(f"   ✅ Total records: {feature_count:,}")
 
 print("\n💡 Next Steps:")
