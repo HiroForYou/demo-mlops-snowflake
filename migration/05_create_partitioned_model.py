@@ -27,7 +27,7 @@ session.sql("USE DATABASE BD_AA_DEV").collect()
 session.sql("USE SCHEMA SC_STORAGE_BMX_PS").collect()
 
 registry = Registry(
-    session=session, database_name="BD_AA_DEV", schema_name="MODEL_REGISTRY"
+    session=session, database_name="BD_AA_DEV", schema_name="SC_MODELS_BMX"
 )
 
 print("✅ Connected to Snowflake")
@@ -302,7 +302,7 @@ print("=" * 80)
 result = session.sql(
     """
     SHOW MODELS LIKE 'UNI_BOX_REGRESSION_PARTITIONED' 
-    IN SCHEMA BD_AA_DEV.MODEL_REGISTRY
+    IN SCHEMA BD_AA_DEV.SC_MODELS_BMX
 """
 ).collect()
 
@@ -311,7 +311,7 @@ if result:
 
     versions = session.sql(
         """
-        SHOW VERSIONS IN MODEL BD_AA_DEV.MODEL_REGISTRY.UNI_BOX_REGRESSION_PARTITIONED
+        SHOW VERSIONS IN MODEL BD_AA_DEV.SC_MODELS_BMX.UNI_BOX_REGRESSION_PARTITIONED
     """
     ).collect()
 
@@ -351,7 +351,7 @@ WITH test_predictions AS (
         p.predicted_uni_box_week
     FROM BD_AA_DEV.SC_STORAGE_BMX_PS.TEST_INFERENCE_TEMP t,
         TABLE(
-            BD_AA_DEV.MODEL_REGISTRY.UNI_BOX_REGRESSION_PARTITIONED!PREDICT(
+            BD_AA_DEV.SC_MODELS_BMX.UNI_BOX_REGRESSION_PARTITIONED!PREDICT(
                 t.customer_id,
                 t.sum_past_12_weeks,
                 t.avg_past_12_weeks,

@@ -28,7 +28,7 @@ session.sql("USE SCHEMA SC_STORAGE_BMX_PS").collect()
 registry = Registry(
     session=session,
     database_name="BD_AA_DEV",
-    schema_name="MODEL_REGISTRY"
+    schema_name="SC_MODELS_BMX"
 )
 
 print("✅ Connected to Snowflake")
@@ -52,7 +52,7 @@ print(f"   Alias: PRODUCTION")
 
 # Show model functions
 functions = session.sql("""
-    SHOW FUNCTIONS IN MODEL BD_AA_DEV.MODEL_REGISTRY.UNI_BOX_REGRESSION_PARTITIONED
+    SHOW FUNCTIONS IN MODEL BD_AA_DEV.SC_MODELS_BMX.UNI_BOX_REGRESSION_PARTITIONED
 """).collect()
 
 print(f"\n📋 Available functions:")
@@ -71,7 +71,7 @@ print("="*80)
 fs = FeatureStore(
     session=session,
     database="BD_AA_DEV",
-    name="FEATURE_STORE"
+    name="SC_FEATURES_BMX"
 )
 
 print("✅ Feature Store initialized")
@@ -192,7 +192,7 @@ WITH model_predictions AS (
         p.predicted_uni_box_week
     FROM BD_AA_DEV.SC_STORAGE_BMX_PS.INFERENCE_INPUT_TEMP i,
         TABLE(
-            BD_AA_DEV.MODEL_REGISTRY.UNI_BOX_REGRESSION_PARTITIONED!PREDICT(
+            BD_AA_DEV.SC_MODELS_BMX.UNI_BOX_REGRESSION_PARTITIONED!PREDICT(
                 i.customer_id,
                 {feature_list}
             ) OVER (PARTITION BY i.stats_ntile_group)
@@ -237,7 +237,7 @@ WITH model_predictions AS (
         p.predicted_uni_box_week
     FROM BD_AA_DEV.SC_STORAGE_BMX_PS.INFERENCE_INPUT_TEMP i,
         TABLE(
-            BD_AA_DEV.MODEL_REGISTRY.UNI_BOX_REGRESSION_PARTITIONED!PREDICT(
+            BD_AA_DEV.SC_MODELS_BMX.UNI_BOX_REGRESSION_PARTITIONED!PREDICT(
                 i.customer_id,
                 i.sum_past_12_weeks,
                 i.avg_past_12_weeks,
@@ -320,7 +320,7 @@ WITH model_predictions AS (
         p.predicted_uni_box_week
     FROM BD_AA_DEV.SC_STORAGE_BMX_PS.INFERENCE_INPUT_TEMP i,
         TABLE(
-            BD_AA_DEV.MODEL_REGISTRY.UNI_BOX_REGRESSION_PARTITIONED!PREDICT(
+            BD_AA_DEV.SC_MODELS_BMX.UNI_BOX_REGRESSION_PARTITIONED!PREDICT(
                 i.customer_id,
                 {feature_list}
             ) OVER (PARTITION BY i.stats_ntile_group)

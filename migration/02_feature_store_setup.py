@@ -33,8 +33,8 @@ print("🏪 CREATING FEATURE STORE")
 print("=" * 80)
 
 # Create schema for Feature Store
-session.sql("CREATE SCHEMA IF NOT EXISTS BD_AA_DEV.FEATURE_STORE").collect()
-session.sql("USE SCHEMA BD_AA_DEV.FEATURE_STORE").collect()
+#session.sql("CREATE SCHEMA IF NOT EXISTS BD_AA_DEV.SC_FEATURES_BMX").collect()
+session.sql("USE SCHEMA BD_AA_DEV.SC_FEATURES_BMX").collect()
 
 print("\n✅ Feature Store schema created")
 
@@ -42,7 +42,8 @@ print("\n✅ Feature Store schema created")
 fs = FeatureStore(
     session=session,
     database="BD_AA_DEV",
-    name="FEATURE_STORE",
+    name="SC_FEATURES_BMX",
+    default_warehouse="WH_AA_DEV_DS_SQL",
     creation_mode=CreationMode.CREATE_IF_NOT_EXIST,
 )
 
@@ -216,7 +217,7 @@ print("✅ FEATURE STORE SETUP COMPLETE!")
 print("=" * 80)
 
 print("\n📋 Summary:")
-print(f"   ✅ Feature Store: BD_AA_DEV.FEATURE_STORE")
+print(f"   ✅ Feature Store: BD_AA_DEV.SC_FEATURES_BMX")
 print(f"   ✅ Entity: CUSTOMER_PRODUCT")
 print(f"   ✅ FeatureView: UNI_BOX_FEATURES (v1)")
 # Count actual feature columns (excluding metadata columns)

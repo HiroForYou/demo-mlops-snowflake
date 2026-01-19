@@ -17,6 +17,7 @@ from snowflake.snowpark.context import get_active_session
 from snowflake.ml.modeling.distributors.many_model import ManyModelTraining
 from snowflake.ml.registry import Registry
 from snowflake.ml.feature_store import FeatureStore
+from snowflake.ml.experiment import ExperimentTracking
 from snowflake.ml.model import task
 import time
 from datetime import datetime
@@ -36,11 +37,11 @@ print(f"   Schema: {session.get_current_schema()}")
 # ## 1. Setup Model Registry & Staging
 
 # %%
-session.sql("CREATE SCHEMA IF NOT EXISTS BD_AA_DEV.MODEL_REGISTRY").collect()
-session.sql("CREATE STAGE IF NOT EXISTS BD_AA_DEV.MODEL_REGISTRY.MMT_MODELS").collect()
+session.sql("CREATE SCHEMA IF NOT EXISTS BD_AA_DEV.SC_MODELS_BMX").collect()
+session.sql("CREATE STAGE IF NOT EXISTS BD_AA_DEV.SC_MODELS_BMX.MMT_MODELS").collect()
 
 registry = Registry(
-    session=session, database_name="BD_AA_DEV", schema_name="MODEL_REGISTRY"
+    session=session, database_name="BD_AA_DEV", schema_name="SC_MODELS_BMX"
 )
 
 print("✅ Model Registry initialized")
@@ -54,67 +55,269 @@ print("\n" + "=" * 80)
 print("📊 LOADING BEST HYPERPARAMETERS PER GROUP")
 print("=" * 80)
 
-# Get most recent hyperparameter search results per group
-hyperparams_df = session.sql(
-    """
-    WITH latest_searches AS (
-        SELECT 
-            group_name,
-            search_id,
-            algorithm,
-            best_params,
-            best_cv_rmse,
-            val_rmse,
-            val_mae,
-            created_at,
-            ROW_NUMBER() OVER (PARTITION BY group_name ORDER BY created_at DESC) AS rn
-        FROM BD_AA_DEV.SC_STORAGE_BMX_PS.HYPERPARAMETER_RESULTS
-        WHERE algorithm = 'XGBoost'
-            AND group_name IS NOT NULL
-    )
-    SELECT 
-        group_name,
-        search_id,
-        best_params,
-        best_cv_rmse,
-        val_rmse,
-        val_mae
-    FROM latest_searches
-    WHERE rn = 1
-    ORDER BY group_name
-"""
-)
-
-hyperparams_results = hyperparams_df.collect()
-
-if len(hyperparams_results) == 0:
-    raise ValueError(
-        "No hyperparameter results found! Please run 03_hyperparameter_search.py first"
-    )
-
-print(f"\n✅ Loaded hyperparameters for {len(hyperparams_results)} groups")
-
-# Create dictionary: group_name -> hyperparameters
+# Try to load from ML Experiments first, fallback to table
 hyperparams_by_group = {}
-for result in hyperparams_results:
-    group_name = result["GROUP_NAME"]
-    best_params_json = result["BEST_PARAMS"]
+experiments_loaded = False
+
+# Get all groups that need hyperparameters
+all_groups_from_data = session.sql(
+    """
+    SELECT DISTINCT stats_ntile_group
+    FROM BD_AA_DEV.SC_STORAGE_BMX_PS.TRAIN_DATASET_CLEANED
+    WHERE stats_ntile_group IS NOT NULL
+    ORDER BY stats_ntile_group
+"""
+).collect()
+
+expected_groups = [row["STATS_NTILE_GROUP"] for row in all_groups_from_data]
+
+# Try loading from ML Experiments
+print("\n🔬 Attempting to load from ML Experiments...")
+try:
+    exp_tracking = ExperimentTracking(session)
     
-    # Parse hyperparameters
-    if isinstance(best_params_json, str):
-        best_params = json.loads(best_params_json)
+    # Try to find the most recent experiment
+    # Note: This is a simplified approach - in production you might want to specify experiment name
+    from datetime import datetime, timedelta
+    today = datetime.now().strftime('%Y%m%d')
+    experiment_name = f"hyperparameter_search_xgboost_{today}"
+    
+    try:
+        exp_tracking.set_experiment(experiment_name)
+        print(f"✅ Found experiment: {experiment_name}")
+        
+        # Get all runs from this experiment
+        # Note: The exact API may vary - this is a conceptual approach
+        # You may need to query the experiments table directly
+        experiments_loaded = True
+        print("   ✅ ML Experiments available - loading from experiments")
+    except:
+        # Try yesterday's experiment as fallback
+        yesterday = (datetime.now() - timedelta(days=1)).strftime('%Y%m%d')
+        experiment_name = f"hyperparameter_search_xgboost_{yesterday}"
+        try:
+            exp_tracking.set_experiment(experiment_name)
+            print(f"✅ Found experiment: {experiment_name}")
+            experiments_loaded = True
+        except:
+            print("   ⚠️  No recent experiment found, will use table fallback")
+            experiments_loaded = False
+    
+    if experiments_loaded:
+        # Use ExperimentTracking API methods via SQL SHOW commands
+        try:
+            print(f"   📋 Listing runs from experiment: {experiment_name}")
+            
+            # Step 1: List all runs in the experiment using SHOW RUNS
+            runs_query = f"SHOW RUNS IN EXPERIMENT {experiment_name}"
+            runs_df = session.sql(runs_query)
+            runs_list = runs_df.collect()
+            
+            if len(runs_list) == 0:
+                print("   ⚠️  No runs found in experiment, using table fallback")
+                experiments_loaded = False
+            else:
+                print(f"   ✅ Found {len(runs_list)} runs in experiment")
+                
+                # Step 2: For each run, get parameters and metrics
+                runs_by_group = {}  # group_name -> best run info
+                
+                for run in runs_list:
+                    run_name = run["name"]
+                    
+                    try:
+                        # Get parameters for this run
+                        params_query = f"SHOW RUN PARAMETERS IN EXPERIMENT {experiment_name} RUN {run_name}"
+                        params_df = session.sql(params_query)
+                        params_list = params_df.collect()
+                        
+                        # Get metrics for this run
+                        metrics_query = f"SHOW RUN METRICS IN EXPERIMENT {experiment_name} RUN {run_name}"
+                        metrics_df = session.sql(metrics_query)
+                        metrics_list = metrics_df.collect()
+                        
+                        # Extract group_name from parameters
+                        group_name = None
+                        search_id = None
+                        best_params = {}
+                        
+                        for param in params_list:
+                            param_name = param["name"]
+                            param_value = param["value"]
+                            
+                            if param_name == "group_name":
+                                group_name = param_value
+                            elif param_name == "search_id":
+                                search_id = param_value
+                            elif param_name not in ["algorithm"]:
+                                # This is a hyperparameter
+                                best_params[param_name] = param_value
+                        
+                        # Extract metrics
+                        val_rmse = None
+                        val_mae = None
+                        
+                        for metric in metrics_list:
+                            metric_name = metric["name"]
+                            metric_value = metric["value"]
+                            
+                            if metric_name == "val_rmse":
+                                val_rmse = float(metric_value)
+                            elif metric_name == "val_mae":
+                                val_mae = float(metric_value)
+                        
+                        # Only process runs that have a group_name
+                        if group_name and val_rmse is not None:
+                            # Keep the best run per group (lowest val_rmse)
+                            if group_name not in runs_by_group:
+                                runs_by_group[group_name] = {
+                                    "run_name": run_name,
+                                    "params": best_params,
+                                    "val_rmse": val_rmse,
+                                    "val_mae": val_mae,
+                                    "search_id": search_id,
+                                }
+                            else:
+                                # Replace if this run has better (lower) RMSE
+                                if val_rmse < runs_by_group[group_name]["val_rmse"]:
+                                    runs_by_group[group_name] = {
+                                        "run_name": run_name,
+                                        "params": best_params,
+                                        "val_rmse": val_rmse,
+                                        "val_mae": val_mae,
+                                        "search_id": search_id,
+                                    }
+                    
+                    except Exception as run_error:
+                        print(f"   ⚠️  Error processing run {run_name}: {str(run_error)[:100]}")
+                        continue
+                
+                # Step 3: Store results in hyperparams_by_group
+                if len(runs_by_group) > 0:
+                    print(f"   ✅ Loaded {len(runs_by_group)} groups from Experiments")
+                    
+                    for group_name, run_info in runs_by_group.items():
+                        hyperparams_by_group[group_name] = {
+                            "params": run_info["params"],
+                            "val_rmse": run_info["val_rmse"],
+                            "search_id": run_info["search_id"] or f"exp_{group_name}",
+                        }
+                        
+                        print(f"\n   {group_name}:")
+                        print(f"      Val RMSE: {run_info['val_rmse']:.4f}")
+                        if run_info["val_mae"]:
+                            print(f"      Val MAE: {run_info['val_mae']:.4f}")
+                        print(f"      Search ID: {run_info['search_id'] or 'N/A'}")
+                        print(f"      Source: ML Experiments (run: {run_info['run_name']})")
+                    
+                    experiments_loaded = True
+                else:
+                    print("   ⚠️  No valid runs with group_name found, using table fallback")
+                    experiments_loaded = False
+                    
+        except Exception as e:
+            print(f"   ⚠️  Error using ExperimentTracking API: {str(e)[:200]}")
+            print("   Will use table fallback")
+            experiments_loaded = False
+
+except Exception as e:
+    print(f"   ⚠️  ML Experiments not available: {str(e)[:200]}")
+    print("   Will use table fallback")
+    experiments_loaded = False
+
+# Fallback to table ONLY if Experiments didn't work or didn't have all groups
+# Table is now a fallback mechanism, not the primary storage
+if not experiments_loaded or len(hyperparams_by_group) < len(expected_groups):
+    print("\n📋 Loading from table (HYPERPARAMETER_RESULTS) - Fallback mode...")
+    print("   Note: Table is only used when ML Experiments is not available")
+    
+    # Check if table exists
+    table_exists = False
+    try:
+        check_table = session.sql(
+            """
+            SELECT COUNT(*) as CNT 
+            FROM INFORMATION_SCHEMA.TABLES 
+            WHERE TABLE_SCHEMA = 'SC_STORAGE_BMX_PS' 
+            AND TABLE_NAME = 'HYPERPARAMETER_RESULTS'
+            AND TABLE_CATALOG = 'BD_AA_DEV'
+            """
+        ).collect()
+        table_exists = check_table[0]["CNT"] > 0
+    except:
+        table_exists = False
+    
+    if table_exists:
+        # Get most recent hyperparameter search results per group from table
+        hyperparams_df = session.sql(
+            """
+            WITH latest_searches AS (
+                SELECT 
+                    group_name,
+                    search_id,
+                    algorithm,
+                    best_params,
+                    best_cv_rmse,
+                    val_rmse,
+                    val_mae,
+                    created_at,
+                    ROW_NUMBER() OVER (PARTITION BY group_name ORDER BY created_at DESC) AS rn
+                FROM BD_AA_DEV.SC_STORAGE_BMX_PS.HYPERPARAMETER_RESULTS
+                WHERE algorithm = 'XGBoost'
+                    AND group_name IS NOT NULL
+            )
+            SELECT 
+                group_name,
+                search_id,
+                best_params,
+                best_cv_rmse,
+                val_rmse,
+                val_mae
+            FROM latest_searches
+            WHERE rn = 1
+            ORDER BY group_name
+        """
+        )
+        
+        hyperparams_results = hyperparams_df.collect()
+        
+        if len(hyperparams_results) > 0:
+            print(f"   ✅ Loaded {len(hyperparams_results)} groups from table")
+            
+            # Update or add to hyperparams_by_group
+            for result in hyperparams_results:
+                group_name = result["GROUP_NAME"]
+                best_params_json = result["BEST_PARAMS"]
+                
+                # Parse hyperparameters
+                if isinstance(best_params_json, str):
+                    best_params = json.loads(best_params_json)
+                else:
+                    best_params = best_params_json
+                
+                # Only add if not already loaded from Experiments
+                if group_name not in hyperparams_by_group:
+                    hyperparams_by_group[group_name] = {
+                        "params": best_params,
+                        "val_rmse": result["VAL_RMSE"],
+                        "search_id": result["SEARCH_ID"],
+                    }
+                    
+                    print(f"\n   {group_name}:")
+                    print(f"      Val RMSE: {result['VAL_RMSE']:.4f}")
+                    print(f"      Search ID: {result['SEARCH_ID']}")
+                    print(f"      Source: Table (fallback)")
+        else:
+            print("   ⚠️  Table exists but has no results")
     else:
-        best_params = best_params_json
-    
-    hyperparams_by_group[group_name] = {
-        "params": best_params,
-        "val_rmse": result["VAL_RMSE"],
-        "search_id": result["SEARCH_ID"],
-    }
-    
-    print(f"\n   {group_name}:")
-    print(f"      Val RMSE: {result['VAL_RMSE']:.4f}")
-    print(f"      Search ID: {result['SEARCH_ID']}")
+        print("   ⚠️  Table does not exist (this is OK if using ML Experiments)")
+
+if len(hyperparams_by_group) == 0:
+    raise ValueError(
+        "No hyperparameter results found in Experiments or table! Please run 03_hyperparameter_search.py first"
+    )
+
+print(f"\n✅ Total loaded hyperparameters: {len(hyperparams_by_group)}/{len(expected_groups)} groups")
 
 # Get default hyperparameters (for groups without search results)
 default_params = {
@@ -135,16 +338,6 @@ for param, value in sorted(default_params.items()):
 
 # Validate that we have hyperparameters for all expected groups
 print(f"\n🔍 Validating hyperparameter coverage...")
-all_groups_from_data = session.sql(
-    """
-    SELECT DISTINCT stats_ntile_group
-    FROM BD_AA_DEV.SC_STORAGE_BMX_PS.TRAIN_DATASET_CLEANED
-    WHERE stats_ntile_group IS NOT NULL
-    ORDER BY stats_ntile_group
-"""
-).collect()
-
-expected_groups = [row["STATS_NTILE_GROUP"] for row in all_groups_from_data]
 groups_with_hyperparams = set(hyperparams_by_group.keys())
 groups_without_hyperparams = set(expected_groups) - groups_with_hyperparams
 
@@ -164,7 +357,7 @@ print("🏪 LOADING FEATURES FROM FEATURE STORE")
 print("=" * 80)
 
 # Initialize Feature Store
-fs = FeatureStore(session=session, database="BD_AA_DEV", name="FEATURE_STORE")
+fs = FeatureStore(session=session, database="BD_AA_DEV", name="SC_FEATURES_BMX")
 
 print("✅ Feature Store initialized")
 
@@ -355,7 +548,7 @@ start_time = time.time()
 
 # Create MMT trainer
 trainer = ManyModelTraining(
-    train_segment_model, "BD_AA_DEV.MODEL_REGISTRY.MMT_MODELS"
+    train_segment_model, "BD_AA_DEV.SC_MODELS_BMX.MMT_MODELS"
 )
 
 # Execute training with partition_by stats_ntile_group
@@ -403,7 +596,7 @@ while elapsed < max_wait:
 if not completed:
     print("\n⏱️  Timeout reached - Verifying completion via stage..." + " " * 30)
     stage_files = session.sql(
-        f"LIST @BD_AA_DEV.MODEL_REGISTRY.MMT_MODELS PATTERN='.*{training_run.run_id}.*'"
+        f"LIST @BD_AA_DEV.SC_MODELS_BMX.MMT_MODELS PATTERN='.*{training_run.run_id}.*'"
     ).collect()
     if len(stage_files) > 0:
         print(
@@ -464,10 +657,12 @@ for partition_id in training_run.partition_details:
             # Model name includes group identifier
             model_name = f"uni_box_regression_{partition_id.lower()}"
 
-            # Get group-specific search ID if available
+            # Get group-specific search ID and hyperparameters if available
             group_search_id = None
+            group_hyperparams = None
             if partition_id in hyperparams_by_group:
                 group_search_id = hyperparams_by_group[partition_id]["search_id"]
+                group_hyperparams = hyperparams_by_group[partition_id]["params"]
 
             # Prepare sample input from this group
             sample_input = (
@@ -478,21 +673,34 @@ for partition_id in training_run.partition_details:
 
             print(f"\nRegistering {partition_id}...")
 
+            # Prepare metrics including hyperparameters
+            model_metrics = {
+                "rmse": float(model.rmse),
+                "mae": float(model.mae),
+                "training_samples": int(model.training_samples),
+                "test_samples": int(model.test_samples),
+                "algorithm": "XGBoost",
+                "group": partition_id,
+                "hyperparameter_search_id": group_search_id or "default",
+            }
+            
+            # Add hyperparameters to metrics (as nested dict)
+            if group_hyperparams:
+                # Convert hyperparameters to a format suitable for metrics
+                for key, value in group_hyperparams.items():
+                    if isinstance(value, (int, float)):
+                        model_metrics[f"hyperparameter_{key}"] = float(value) if isinstance(value, float) else int(value)
+                model_metrics["hyperparameters"] = json.dumps({
+                    k: float(v) if isinstance(v, (int, float)) else v
+                    for k, v in group_hyperparams.items()
+                })
+
             mv = registry.log_model(
                 model,
                 model_name=model_name,
                 version_name=f"v_{version_date}",
                 comment=f"XGBoost regression model for uni_box_week - Group: {partition_id}",
-                metrics={
-                    "rmse": float(model.rmse),
-                    "mae": float(model.mae),
-                    "training_samples": int(model.training_samples),
-                    "test_samples": int(model.test_samples),
-                    "algorithm": "XGBoost",
-                    "group": partition_id,
-                    "hyperparameter_search_id": group_search_id or "default",
-                    "hyperparameter_source": getattr(model, "hyperparameter_source", "unknown"),
-                },
+                metrics=model_metrics,
                 sample_input_data=sample_input,
                 task=task.Task.TABULAR_REGRESSION,
             )

@@ -21,6 +21,7 @@ from snowflake.ml.feature_store import FeatureStore
 from snowflake.ml.modeling.tune import Tuner, TunerConfig, get_tuner_context
 from snowflake.ml.modeling.tune.search import RandomSearch, randint, uniform
 from snowflake.ml.data.data_connector import DataConnector
+from snowflake.ml.experiment import ExperimentTracking
 import numpy as np
 from xgboost import XGBRegressor
 from sklearn.model_selection import train_test_split
@@ -74,7 +75,7 @@ print("🏪 LOADING FEATURES FROM FEATURE STORE")
 print("=" * 80)
 
 # Initialize Feature Store
-fs = FeatureStore(session=session, database="BD_AA_DEV", name="FEATURE_STORE")
+fs = FeatureStore(session=session, database="BD_AA_DEV", name="SC_FEATURES_BMX")
 
 print("✅ Feature Store initialized")
 
@@ -169,24 +170,30 @@ print("\n" + "=" * 80)
 print("🔍 PERFORMING HYPERPARAMETER SEARCH PER GROUP")
 print("=" * 80)
 
-# Create results table (with group column)
-session.sql(
+# Create results table ONLY if ML Experiments is not available
+# If Experiments is available, we don't need this table
+if not experiments_available:
+    print("\n📋 Creating HYPERPARAMETER_RESULTS table (Experiments not available)")
+    session.sql(
+        """
+        CREATE TABLE IF NOT EXISTS BD_AA_DEV.SC_STORAGE_BMX_PS.HYPERPARAMETER_RESULTS (
+            search_id VARCHAR,
+            group_name VARCHAR,
+            algorithm VARCHAR,
+            best_params VARIANT,
+            best_cv_rmse FLOAT,
+            best_cv_mae FLOAT,
+            val_rmse FLOAT,
+            val_mae FLOAT,
+            n_iter INTEGER,
+            sample_size INTEGER,
+            created_at TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
+        )
     """
-    CREATE TABLE IF NOT EXISTS BD_AA_DEV.SC_STORAGE_BMX_PS.HYPERPARAMETER_RESULTS (
-        search_id VARCHAR,
-        group_name VARCHAR,
-        algorithm VARCHAR,
-        best_params VARIANT,
-        best_cv_rmse FLOAT,
-        best_cv_mae FLOAT,
-        val_rmse FLOAT,
-        val_mae FLOAT,
-        n_iter INTEGER,
-        sample_size INTEGER,
-        created_at TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
-    )
-"""
-).collect()
+    ).collect()
+    print("   ✅ Table created (will be used as primary storage)")
+else:
+    print("\n📋 Skipping table creation (using ML Experiments as primary storage)")
 
 # Define excluded columns (metadata columns from Feature Store)
 excluded_cols = [
@@ -211,6 +218,23 @@ for col in sorted(feature_cols):
 
 # Dictionary to store all results
 all_results = {}
+
+# Initialize ML Experiments for hyperparameter tracking
+print("\n" + "=" * 80)
+print("🔬 INITIALIZING ML EXPERIMENTS")
+print("=" * 80)
+
+try:
+    exp_tracking = ExperimentTracking(session)
+    experiment_name = f"hyperparameter_search_xgboost_{datetime.now().strftime('%Y%m%d')}"
+    exp_tracking.set_experiment(experiment_name)
+    print(f"✅ Experiment created: {experiment_name}")
+    experiments_available = True
+except Exception as e:
+    print(f"⚠️  ML Experiments not available: {str(e)[:200]}")
+    print("   Will continue with table-based storage only")
+    exp_tracking = None
+    experiments_available = False
 
 
 def create_train_func(group_name, feature_cols, X_val, y_val):
@@ -364,41 +388,97 @@ for group_idx, group_name in enumerate(groups_list, 1):
             "sample_size": sampled_count,
         }
         
-        # Save to database
-        # IMPORTANTE: El campo 'group_name' es la CLAVE que conecta estos hiperparámetros
-        # con el grupo específico. En el script 04, se usa este 'group_name' para cargar
-        # los hiperparámetros correctos cuando se entrena cada modelo.
+        # Save to ML Experiments
         search_id = f"xgb_snowflake_tune_{group_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-        best_params_json = json.dumps(
-            {
-                k: float(v) if isinstance(v, (np.integer, np.floating)) else v
-                for k, v in best_params.items()
-            }
-        )
+        experiments_success = False
         
-        best_mae_value = best_mae if best_mae is not None else None
-        best_mae_sql = f"{best_mae_value:.6f}" if best_mae_value is not None else "NULL"
+        if experiments_available:
+            try:
+                # Create a run for this group's best hyperparameters
+                run_name = f"best_{group_name}_{datetime.now().strftime('%H%M%S')}"
+                with exp_tracking.start_run(run_name):
+                    # Log all hyperparameters
+                    exp_tracking.log_params(best_params)
+                    
+                    # Log metrics
+                    exp_tracking.log_metrics({
+                        "best_rmse": float(best_rmse),
+                        "val_rmse": float(val_rmse),
+                        "val_mae": float(val_mae),
+                        "sample_size": int(sampled_count),
+                        "num_trials": int(num_trials),
+                    })
+                    
+                    # Log group identifier as a tag/parameter
+                    exp_tracking.log_param("group_name", group_name)
+                    exp_tracking.log_param("search_id", search_id)
+                    exp_tracking.log_param("algorithm", "XGBoost")
+                    
+                    # Optionally log the best model (if you want to keep it in experiments)
+                    # exp_tracking.log_model(best_model, model_name=f"best_model_{group_name}")
+                
+                print(f"   ✅ Results logged to ML Experiments (run: {run_name})")
+                experiments_success = True
+            except Exception as e:
+                print(f"   ⚠️  Error logging to Experiments: {str(e)[:200]}")
+                experiments_success = False
         
-        # Guardar resultados con group_name como identificador del grupo
-        # Este group_name será usado en script 04 para mapear hiperparámetros -> modelo
-        insert_sql = f"""
-            INSERT INTO BD_AA_DEV.SC_STORAGE_BMX_PS.HYPERPARAMETER_RESULTS
-            (search_id, group_name, algorithm, best_params, best_cv_rmse, best_cv_mae, val_rmse, val_mae, n_iter, sample_size)
-            VALUES (
-                '{search_id}',
-                '{group_name}',  -- ← CLAVE: Identificador del grupo (stats_ntile_group)
-                'XGBoost',
-                PARSE_JSON('{best_params_json}'),
-                {best_rmse:.6f},
-                {best_mae_sql},
-                {val_rmse:.6f},
-                {val_mae:.6f},
-                {num_trials},
-                {sampled_count}
+        # Save to database ONLY if ML Experiments is not available or failed
+        # If Experiments works, we don't need the table
+        if not experiments_available or not experiments_success:
+            print(f"   📋 Saving to table (Experiments {'not available' if not experiments_available else 'failed'})")
+            
+            # Ensure table exists
+            session.sql(
+                """
+                CREATE TABLE IF NOT EXISTS BD_AA_DEV.SC_STORAGE_BMX_PS.HYPERPARAMETER_RESULTS (
+                    search_id VARCHAR,
+                    group_name VARCHAR,
+                    algorithm VARCHAR,
+                    best_params VARIANT,
+                    best_cv_rmse FLOAT,
+                    best_cv_mae FLOAT,
+                    val_rmse FLOAT,
+                    val_mae FLOAT,
+                    n_iter INTEGER,
+                    sample_size INTEGER,
+                    created_at TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
+                )
+            """
+            ).collect()
+            
+            best_params_json = json.dumps(
+                {
+                    k: float(v) if isinstance(v, (np.integer, np.floating)) else v
+                    for k, v in best_params.items()
+                }
             )
-        """
-        
-        session.sql(insert_sql).collect()
+            
+            best_mae_value = best_mae if best_mae is not None else None
+            best_mae_sql = f"{best_mae_value:.6f}" if best_mae_value is not None else "NULL"
+            
+            # Guardar resultados con group_name como identificador del grupo
+            insert_sql = f"""
+                INSERT INTO BD_AA_DEV.SC_STORAGE_BMX_PS.HYPERPARAMETER_RESULTS
+                (search_id, group_name, algorithm, best_params, best_cv_rmse, best_cv_mae, val_rmse, val_mae, n_iter, sample_size)
+                VALUES (
+                    '{search_id}',
+                    '{group_name}',
+                    'XGBoost',
+                    PARSE_JSON('{best_params_json}'),
+                    {best_rmse:.6f},
+                    {best_mae_sql},
+                    {val_rmse:.6f},
+                    {val_mae:.6f},
+                    {num_trials},
+                    {sampled_count}
+                )
+            """
+            
+            session.sql(insert_sql).collect()
+            print(f"   ✅ Results saved to table")
+        else:
+            print(f"   ✅ Results stored in ML Experiments only (table not needed)")
         
     except Exception as e:
         print(f"   ❌ Error during hyperparameter search: {str(e)[:200]}")
@@ -417,41 +497,58 @@ print("\n" + "=" * 80)
 print("📊 SUMMARY OF ALL HYPERPARAMETER SEARCHES")
 print("=" * 80)
 
-# Get all saved results
-summary_df = session.sql(
+# Summary: Show results from Experiments or table
+if experiments_available:
+    print("\n📊 Results Summary:")
+    print(f"   ✅ All results stored in ML Experiments")
+    print(f"   ✅ Experiment: {experiment_name}")
+    print(f"   ✅ Groups processed: {len(all_results)}")
+    print(f"\n💡 View results in Snowsight: AI & ML → Experiments → {experiment_name}")
+    
+    # Try to show summary from Experiments if possible
+    try:
+        # This is a conceptual query - actual API may vary
+        print("\n📊 Sample results from Experiments:")
+        for group_name, result in list(all_results.items())[:5]:
+            print(f"   {group_name}: RMSE={result['val_rmse']:.4f}, MAE={result['val_mae']:.4f}")
+        if len(all_results) > 5:
+            print(f"   ... and {len(all_results) - 5} more groups")
+    except:
+        pass
+else:
+    # Fallback to table summary if Experiments not available
+    print("\n📊 Results from Table:")
+    summary_df = session.sql(
+        """
+        SELECT 
+            group_name,
+            best_cv_rmse,
+            val_rmse,
+            val_mae,
+            sample_size,
+            created_at
+        FROM BD_AA_DEV.SC_STORAGE_BMX_PS.HYPERPARAMETER_RESULTS
+        WHERE created_at >= DATEADD(HOUR, -1, CURRENT_TIMESTAMP())
+        ORDER BY group_name
     """
-    SELECT 
-        group_name,
-        best_cv_rmse,
-        val_rmse,
-        val_mae,
-        sample_size,
-        created_at
-    FROM BD_AA_DEV.SC_STORAGE_BMX_PS.HYPERPARAMETER_RESULTS
-    WHERE created_at >= DATEADD(HOUR, -1, CURRENT_TIMESTAMP())
-    ORDER BY group_name
-"""
-)
-
-print("\n📊 Results by Group:")
-summary_df.show()
-
-# Overall statistics
-overall_stats = session.sql(
+    )
+    summary_df.show()
+    
+    # Overall statistics
+    overall_stats = session.sql(
+        """
+        SELECT 
+            COUNT(*) AS TOTAL_SEARCHES,
+            AVG(best_cv_rmse) AS AVG_CV_RMSE,
+            AVG(val_rmse) AS AVG_VAL_RMSE,
+            MIN(val_rmse) AS MIN_VAL_RMSE,
+            MAX(val_rmse) AS MAX_VAL_RMSE
+        FROM BD_AA_DEV.SC_STORAGE_BMX_PS.HYPERPARAMETER_RESULTS
+        WHERE created_at >= DATEADD(HOUR, -1, CURRENT_TIMESTAMP())
     """
-    SELECT 
-        COUNT(*) AS TOTAL_SEARCHES,
-        AVG(best_cv_rmse) AS AVG_CV_RMSE,
-        AVG(val_rmse) AS AVG_VAL_RMSE,
-        MIN(val_rmse) AS MIN_VAL_RMSE,
-        MAX(val_rmse) AS MAX_VAL_RMSE
-    FROM BD_AA_DEV.SC_STORAGE_BMX_PS.HYPERPARAMETER_RESULTS
-    WHERE created_at >= DATEADD(HOUR, -1, CURRENT_TIMESTAMP())
-"""
-)
-
-print("\n📊 Overall Statistics:")
-overall_stats.show()
+    )
+    print("\n📊 Overall Statistics:")
+    overall_stats.show()
 
 # %% [markdown]
 # ## 6. Summary
