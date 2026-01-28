@@ -33,6 +33,11 @@ print(f"✅ Connected to Snowflake")
 print(f"   Database: {session.get_current_database()}")
 print(f"   Schema: {session.get_current_schema()}")
 
+# Configuración:
+# - Si no tienes permisos para FeatureView/Dynamic Tables, usa tablas limpias o tabla de features materializada.
+USE_CLEANED_TABLES = False  # True = TRAIN_DATASET_CLEANED, False = intentar tabla de features materializada
+FEATURES_TABLE = "BD_AA_DEV.SC_FEATURES_BMX.UNI_BOX_FEATURES"  # creada por 02_feature_store_setup.py
+
 # %% [markdown]
 # ## 1. Setup Model Registry & Staging
 
@@ -349,51 +354,50 @@ else:
     print(f"✅ All {len(expected_groups)} groups have optimized hyperparameters!")
 
 # %% [markdown]
-# ## 3. Prepare Training Data from Feature Store
+# ## 3. Preparar datos de entrenamiento (sin FeatureView)
 
 # %%
 print("\n" + "=" * 80)
-print("🏪 LOADING FEATURES FROM FEATURE STORE")
+print("🏪 LOADING TRAINING DATA (SIN FEATURE VIEW)")
 print("=" * 80)
 
-# Initialize Feature Store
-fs = FeatureStore(session=session, database="BD_AA_DEV", name="SC_FEATURES_BMX")
-
-print("✅ Feature Store initialized")
-
-# Get FeatureView
-try:
-    feature_view = fs.get_feature_view("UNI_BOX_FEATURES", version="v1")
-    print("✅ FeatureView 'UNI_BOX_FEATURES' v1 loaded")
-except Exception as e:
-    # Try v2 if v1 doesn't exist
+if USE_CLEANED_TABLES:
+    print("📊 Loading from cleaned table: TRAIN_DATASET_CLEANED")
+    training_df = session.table("BD_AA_DEV.SC_STORAGE_BMX_PS.TRAIN_DATASET_CLEANED")
+    print(f"\n✅ Training data loaded from cleaned table")
+    print(f"   Total records: {training_df.count():,}")
+    print(f"   Columns: {len(training_df.columns)}")
+else:
+    # Preferimos la tabla materializada de features (sin Dynamic Tables).
+    # Si falla por permisos/no existencia, hacemos fallback a la tabla limpia.
     try:
-        feature_view = fs.get_feature_view("UNI_BOX_FEATURES", version="v2")
-        print("✅ FeatureView 'UNI_BOX_FEATURES' v2 loaded")
-    except:
-        print(f"❌ Error loading FeatureView: {str(e)}")
-        print("   Please run 02_feature_store_setup.py first")
-        raise
+        # Mantener inicialización del Feature Store (aunque no usemos FeatureView)
+        _fs = FeatureStore(session=session, database="BD_AA_DEV", name="SC_FEATURES_BMX")
+        print("✅ Feature Store inicializado (sin FeatureView)")
 
-# Materialize features (get the feature data)
-print("\n⏳ Materializing features from Feature Store...")
-features_df = feature_view.get_features()
+        print(f"📊 Loading features from table: {FEATURES_TABLE}")
+        features_df = session.table(FEATURES_TABLE)
 
-# Get target and stats_ntile_group from cleaned training table
-print("⏳ Loading target variable and stats_ntile_group from training table...")
-target_df = session.table("BD_AA_DEV.SC_STORAGE_BMX_PS.TRAIN_DATASET_CLEANED").select(
-    "customer_id", "brand_pres_ret", "week", "uni_box_week", "stats_ntile_group"
-)
+        print("⏳ Loading target variable and stats_ntile_group from training table...")
+        target_df = session.table("BD_AA_DEV.SC_STORAGE_BMX_PS.TRAIN_DATASET_CLEANED").select(
+            "customer_id", "brand_pres_ret", "week", "uni_box_week", "stats_ntile_group"
+        )
 
-# Join features with target
-print("⏳ Joining features with target...")
-training_df = features_df.join(
-    target_df, on=["customer_id", "brand_pres_ret", "week"], how="inner"
-)
+        print("⏳ Joining features with target...")
+        training_df = features_df.join(
+            target_df, on=["customer_id", "brand_pres_ret", "week"], how="inner"
+        )
 
-print(f"\n✅ Training data loaded from Feature Store")
-print(f"   Total records: {training_df.count():,}")
-print(f"   Columns: {len(training_df.columns)}")
+        print(f"\n✅ Training data loaded from features table + target")
+        print(f"   Total records: {training_df.count():,}")
+        print(f"   Columns: {len(training_df.columns)}")
+    except Exception as e:
+        print(f"⚠️  Could not load/join features table ({FEATURES_TABLE}): {str(e)[:200]}")
+        print("   Falling back to TRAIN_DATASET_CLEANED")
+        training_df = session.table("BD_AA_DEV.SC_STORAGE_BMX_PS.TRAIN_DATASET_CLEANED")
+        print(f"\n✅ Training data loaded from cleaned table (fallback)")
+        print(f"   Total records: {training_df.count():,}")
+        print(f"   Columns: {len(training_df.columns)}")
 
 # Show distribution by group
 print("\n📊 Records per Group:")
@@ -441,12 +445,12 @@ def train_segment_model(data_connector, context):
     df = data_connector.to_pandas()
     print(f"📊 Data shape: {df.shape}")
 
-    # Define excluded columns (metadata columns from Feature Store)
+    # Define excluded columns (metadata / non-features)
     excluded_cols = [
         "customer_id",
         "brand_pres_ret",
         "week",
-        "FEATURE_TIMESTAMP",  # Feature Store timestamp column
+        "FEATURE_TIMESTAMP",  # puede existir si usas tabla de features
         "stats_ntile_group",  # Group column - not a feature
     ]
 
