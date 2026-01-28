@@ -35,8 +35,8 @@ print("\n" + "=" * 80)
 print("🏪 PREPARANDO ESQUEMA DE FEATURES (SIN FEATURE VIEW)")
 print("=" * 80)
 
-# Crear schema destino (si no tienes permiso para crear schema, fallará aquí)
-session.sql("CREATE SCHEMA IF NOT EXISTS BD_AA_DEV.SC_FEATURES_BMX").collect()
+# Crear schema destino (comentado por falta de permisos)
+# session.sql("CREATE SCHEMA IF NOT EXISTS BD_AA_DEV.SC_FEATURES_BMX").collect()
 session.sql("USE SCHEMA BD_AA_DEV.SC_FEATURES_BMX").collect()
 print("\n✅ Schema listo: BD_AA_DEV.SC_FEATURES_BMX")
 

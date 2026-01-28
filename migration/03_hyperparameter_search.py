@@ -18,8 +18,8 @@
 # %%
 from snowflake.snowpark.context import get_active_session
 from snowflake.ml.feature_store import FeatureStore
-from snowflake.ml.modeling.tune import Tuner, TunerConfig, get_tuner_context
-from snowflake.ml.modeling.tune.search import RandomSearch, randint, uniform
+from snowflake.ml.modeling.tune import Tuner, TunerConfig, get_tuner_context, randint, uniform
+from snowflake.ml.modeling.tune.search import RandomSearch
 from snowflake.ml.data.data_connector import DataConnector
 from snowflake.ml.experiment import ExperimentTracking
 from snowflake.ml.modeling.distributors.many_model import ManyModelTraining
@@ -152,7 +152,9 @@ for param, dist in search_space.items():
         if hasattr(dist, "base"):  # loguniform
             print(f"   {param}: loguniform({dist.low:.2f}, {dist.high:.2f})")
         else:  # uniform or randint
-            if isinstance(dist, randint):
+            # En versiones recientes `randint`/`uniform` son factories; evitamos isinstance().
+            dist_name = dist.__class__.__name__.lower()
+            if "rand" in dist_name and "int" in dist_name:
                 print(f"   {param}: randint({dist.low}, {dist.high})")
             else:
                 print(f"   {param}: uniform({dist.low:.2f}, {dist.high:.2f})")
@@ -207,7 +209,7 @@ if not experiments_available:
     print("\n📋 Creating HYPERPARAMETER_RESULTS table (Experiments not available)")
     session.sql(
         """
-        CREATE TABLE IF NOT EXISTS BD_AA_DEV.SC_STORAGE_BMX_PS.HYPERPARAMETER_RESULTS (
+        CREATE TABLE IF NOT EXISTS BD_AA_DEV.SC_MODELS_BMX.HYPERPARAMETER_RESULTS (
             search_id VARCHAR,
             group_name VARCHAR,
             algorithm VARCHAR,
@@ -526,7 +528,7 @@ def search_hyperparameters_for_group(data_connector, context):
             # Ensure table exists
             session.sql(
                 """
-                CREATE TABLE IF NOT EXISTS BD_AA_DEV.SC_STORAGE_BMX_PS.HYPERPARAMETER_RESULTS (
+                CREATE TABLE IF NOT EXISTS BD_AA_DEV.SC_MODELS_BMX.HYPERPARAMETER_RESULTS (
                     search_id VARCHAR,
                     group_name VARCHAR,
                     algorithm VARCHAR,
@@ -554,7 +556,7 @@ def search_hyperparameters_for_group(data_connector, context):
             
             # Guardar resultados con group_name como identificador del grupo
             insert_sql = f"""
-                INSERT INTO BD_AA_DEV.SC_STORAGE_BMX_PS.HYPERPARAMETER_RESULTS
+                INSERT INTO BD_AA_DEV.SC_MODELS_BMX.HYPERPARAMETER_RESULTS
                 (search_id, group_name, algorithm, best_params, best_cv_rmse, best_cv_mae, val_rmse, val_mae, n_iter, sample_size)
                 VALUES (
                     '{search_id}',
@@ -601,7 +603,8 @@ def search_hyperparameters_for_group(data_connector, context):
 
 # Setup MMT stage (if needed)
 print("\n📋 Setting up MMT stage for hyperparameter search...")
-session.sql("CREATE SCHEMA IF NOT EXISTS BD_AA_DEV.SC_MODELS_BMX").collect()
+# CREATE SCHEMA comentado (puede requerir permisos)
+# session.sql("CREATE SCHEMA IF NOT EXISTS BD_AA_DEV.SC_MODELS_BMX").collect()
 session.sql("CREATE STAGE IF NOT EXISTS BD_AA_DEV.SC_MODELS_BMX.MMT_HYPERPARAMETER_SEARCH").collect()
 print("   ✅ MMT stage created")
 
@@ -767,7 +770,7 @@ else:
             val_mae,
             sample_size,
             created_at
-        FROM BD_AA_DEV.SC_STORAGE_BMX_PS.HYPERPARAMETER_RESULTS
+        FROM BD_AA_DEV.SC_MODELS_BMX.HYPERPARAMETER_RESULTS
         WHERE created_at >= DATEADD(HOUR, -1, CURRENT_TIMESTAMP())
         ORDER BY group_name
     """
@@ -783,7 +786,7 @@ else:
             AVG(val_rmse) AS AVG_VAL_RMSE,
             MIN(val_rmse) AS MIN_VAL_RMSE,
             MAX(val_rmse) AS MAX_VAL_RMSE
-        FROM BD_AA_DEV.SC_STORAGE_BMX_PS.HYPERPARAMETER_RESULTS
+        FROM BD_AA_DEV.SC_MODELS_BMX.HYPERPARAMETER_RESULTS
         WHERE created_at >= DATEADD(HOUR, -1, CURRENT_TIMESTAMP())
     """
     )

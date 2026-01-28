@@ -42,7 +42,8 @@ FEATURES_TABLE = "BD_AA_DEV.SC_FEATURES_BMX.UNI_BOX_FEATURES"  # creada por 02_f
 # ## 1. Setup Model Registry & Staging
 
 # %%
-session.sql("CREATE SCHEMA IF NOT EXISTS BD_AA_DEV.SC_MODELS_BMX").collect()
+# CREATE SCHEMA comentado (puede requerir permisos)
+# session.sql("CREATE SCHEMA IF NOT EXISTS BD_AA_DEV.SC_MODELS_BMX").collect()
 session.sql("CREATE STAGE IF NOT EXISTS BD_AA_DEV.SC_MODELS_BMX.MMT_MODELS").collect()
 
 registry = Registry(
@@ -243,7 +244,7 @@ if not experiments_loaded or len(hyperparams_by_group) < len(expected_groups):
             """
             SELECT COUNT(*) as CNT 
             FROM INFORMATION_SCHEMA.TABLES 
-            WHERE TABLE_SCHEMA = 'SC_STORAGE_BMX_PS' 
+            WHERE TABLE_SCHEMA = 'SC_MODELS_BMX' 
             AND TABLE_NAME = 'HYPERPARAMETER_RESULTS'
             AND TABLE_CATALOG = 'BD_AA_DEV'
             """
@@ -267,7 +268,7 @@ if not experiments_loaded or len(hyperparams_by_group) < len(expected_groups):
                     val_mae,
                     created_at,
                     ROW_NUMBER() OVER (PARTITION BY group_name ORDER BY created_at DESC) AS rn
-                FROM BD_AA_DEV.SC_STORAGE_BMX_PS.HYPERPARAMETER_RESULTS
+                FROM BD_AA_DEV.SC_MODELS_BMX.HYPERPARAMETER_RESULTS
                 WHERE algorithm = 'XGBoost'
                     AND group_name IS NOT NULL
             )
