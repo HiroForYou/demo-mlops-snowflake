@@ -71,7 +71,8 @@ print("="*80)
 fs = FeatureStore(
     session=session,
     database="BD_AA_DEV",
-    name="SC_FEATURES_BMX"
+    name="SC_FEATURES_BMX",
+    default_warehouse="WH_AA_DEV_DS_SQL",
 )
 
 print("✅ Feature Store initialized")

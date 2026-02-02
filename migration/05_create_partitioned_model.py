@@ -2,8 +2,8 @@
 # # Migration: Create Partitioned Model
 #
 # ## Overview
-# This script creates a partitioned model from the trained XGBoost model.
-# Even though we have a single model, we create a partitioned model to enable
+# This script creates a partitioned model from the trained group-specific models (LGBM/XGB/SGD).
+# It combines all per-group models into one partitioned model to enable
 # partitioned inference syntax for consistency and future scalability.
 #
 # ## What We'll Do:
@@ -61,14 +61,14 @@ feature_cols = None
 
 for group_name in groups_list:
     model_name = f"uni_box_regression_{group_name.lower()}"
-    
+
     try:
         model_ref = registry.get_model(model_name)
         model_version = model_ref.version("PRODUCTION")
-        
+
         # Load the model
         native_model = model_version.load()
-        
+
         # Get feature columns from first model
         if feature_cols is None:
             if hasattr(native_model, "feature_cols"):
@@ -79,18 +79,20 @@ for group_name in groups_list:
                     feature_cols = sample_input.columns
                 else:
                     raise ValueError("Cannot determine feature columns from model")
-        
+
         loaded_models[group_name] = {
             "model": native_model,
             "model_version": model_version,
             "model_name": model_name,
         }
-        
+
         print(f"✅ {group_name}: {model_name} loaded")
-        
+
     except Exception as e:
         print(f"❌ {group_name}: Error loading model - {str(e)[:100]}")
-        print(f"   Please ensure all 16 models were trained in 04_many_model_training.py")
+        print(
+            f"   Please ensure all 16 models were trained in 04_many_model_training.py"
+        )
 
 if len(loaded_models) == 0:
     raise ValueError("No models loaded! Please run 04_many_model_training.py first")
@@ -135,14 +137,16 @@ class PartitionedUniBoxModel(custom_model.CustomModel):
             DataFrame with predictions
         """
         if len(input_df) == 0:
-            return pd.DataFrame(columns=["customer_id", "stats_ntile_group", "predicted_uni_box_week"])
+            return pd.DataFrame(
+                columns=["customer_id", "stats_ntile_group", "predicted_uni_box_week"]
+            )
 
         # Get the group name from input
         group_name = input_df["stats_ntile_group"].iloc[0]
-        
+
         # Create key for model lookup (match the key used in ModelContext)
         model_key = f"group_{group_name.lower()}"
-        
+
         # Get the model for this group
         try:
             model = self.context.model_ref(model_key)
@@ -152,7 +156,9 @@ class PartitionedUniBoxModel(custom_model.CustomModel):
                 model_key_alt = group_name.lower()
                 model = self.context.model_ref(model_key_alt)
             except:
-                raise ValueError(f"Model not found for group: {group_name}. Available keys: {list(self.context.models.keys())}")
+                raise ValueError(
+                    f"Model not found for group: {group_name}. Available keys: {list(self.context.models.keys())}"
+                )
 
         # Determine feature columns if not set
         if self.feature_cols is None:
@@ -269,11 +275,11 @@ try:
         partitioned_model,
         model_name="UNI_BOX_REGRESSION_PARTITIONED",
         version_name=f"v_{version_date}",
-        comment=f"Partitioned XGBoost regression model for uni_box_week - Combines {len(loaded_models)} group-specific models",
+        comment=f"Partitioned regression model for uni_box_week - Combines {len(loaded_models)} group-specific models (LGBM/XGB/SGD)",
         metrics={
             "num_groups": len(loaded_models),
             "num_features": len(feature_cols),
-            "model_type": "XGBoost",
+            "model_type": "mixed",
             "groups": ",".join(sorted(loaded_models.keys())),
         },
         sample_input_data=sample_input,
@@ -423,7 +429,9 @@ print(f"   ✅ Partitioned model: UNI_BOX_REGRESSION_PARTITIONED")
 print(f"   ✅ Version: v_{version_date}")
 print(f"   ✅ Alias: PRODUCTION")
 print(f"   ✅ Features: {len(feature_cols)}")
-print(f"   ✅ Groups: {', '.join(sorted(loaded_models.keys())[:5])}... ({len(loaded_models)} total)")
+print(
+    f"   ✅ Groups: {', '.join(sorted(loaded_models.keys())[:5])}... ({len(loaded_models)} total)"
+)
 
 print("\n💡 Next Steps:")
 print("   1. Review partitioned model registration")
