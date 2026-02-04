@@ -271,8 +271,11 @@ except Exception as e:
     print("   Will use table fallback")
     experiments_loaded = False
 
+# %% [markdown]
+# ### 2b. Fallback a tabla (si no hay Experiments o faltan grupos)
+
+# %%
 # Fallback to table ONLY if Experiments didn't work or didn't have all groups
-# Table is now a fallback mechanism, not the primary storage
 if not experiments_loaded or len(hyperparams_by_group) < len(expected_groups):
     print("\n📋 Loading from table (HYPERPARAMETER_RESULTS) - Fallback mode...")
     print("   Note: Table is only used when ML Experiments is not available")
@@ -362,6 +365,10 @@ if not experiments_loaded or len(hyperparams_by_group) < len(expected_groups):
     else:
         print("   ⚠️  Table does not exist (this is OK if using ML Experiments)")
 
+# %% [markdown]
+# ### 2c. Defaults y validación de hiperparámetros
+
+# %%
 if len(hyperparams_by_group) == 0:
     raise ValueError(
         "No hyperparameter results found in Experiments or table! Please run 03_hyperparameter_search.py first"
@@ -478,10 +485,24 @@ else:
         print(f"   Total records: {training_df.count():,}")
         print(f"   Columns: {len(training_df.columns)}")
 
+# Resolver nombre real de la columna de partición (Snowflake suele devolver MAYÚSCULAS)
+# DPFOrchestrator/MMT exige que el nombre de la columna coincida exactamente con partition_by.
+PARTITION_COL = next(
+    (c for c in training_df.columns if c.upper() == "STATS_NTILE_GROUP"),
+    "stats_ntile_group",
+)
+# Normalizar a "stats_ntile_group" para evitar KeyError en el orquestador (pandas busca el nombre literal)
+if PARTITION_COL != "stats_ntile_group":
+    training_df = training_df.with_column_renamed(PARTITION_COL, "stats_ntile_group")
+    PARTITION_COL = "stats_ntile_group"
+    print(f"\n📌 Columna de partición renombrada a: '{PARTITION_COL}'")
+else:
+    print(f"\n📌 Columna de partición usada: '{PARTITION_COL}'")
+
 # Show distribution by group
 print("\n📊 Records per Group:")
 group_counts = (
-    training_df.group_by("stats_ntile_group").count().sort("stats_ntile_group")
+    training_df.group_by(PARTITION_COL).count().sort(PARTITION_COL)
 )
 group_counts.show()
 
@@ -492,6 +513,14 @@ group_counts.show()
 print("\n" + "=" * 80)
 print("🔧 DEFINING TRAINING FUNCTION")
 print("=" * 80)
+
+
+def _get_target_column(df):
+    """Return the target column name in df (case-insensitive match for uni_box_week)."""
+    for c in df.columns:
+        if str(c).upper() == "UNI_BOX_WEEK":
+            return c
+    return "uni_box_week"
 
 
 def train_segment_model(data_connector, context):
@@ -521,12 +550,16 @@ def train_segment_model(data_connector, context):
     df = data_connector.to_pandas()
     print(f"📊 Data shape: {df.shape}")
 
+    # Excluir columna de partición por nombre real (p. ej. STATS_NTILE_GROUP en Snowflake)
+    partition_col_in_df = next(
+        (c for c in df.columns if c.upper() == "STATS_NTILE_GROUP"), "stats_ntile_group"
+    )
     excluded_cols = [
         "customer_id",
         "brand_pres_ret",
         "week",
         "FEATURE_TIMESTAMP",
-        "stats_ntile_group",
+        partition_col_in_df,
     ]
     target_col = _get_target_column(df)
     feature_cols = [
@@ -626,6 +659,44 @@ print("✅ Training function defined")
 
 # %%
 print("\n" + "=" * 80)
+print("📈 SCALING CLUSTER UP FOR MMT")
+print("=" * 80)
+
+try:
+    from snowflake.ml.runtime_cluster import scale_cluster
+
+    print("⏳ Aumentando cluster a 4 contenedores...")
+    scale_cluster(
+        expected_cluster_size=4,
+        options={
+            "block_until_min_cluster_size": 2  # Retorna cuando al menos 2 nodos estén listos
+        }
+    )
+    print("✅ Cluster aumentado a 4 contenedores")
+except Exception as e:
+    print(f"⚠️  Error al escalar cluster: {str(e)[:200]}")
+    print("   Continuando con el cluster actual...")
+
+# %% [markdown]
+# ### 5b. (Opcional) Enlace al Ray Dashboard
+#
+# Copia la URL en tu navegador para monitorear el cluster durante el MMT.
+
+# %%
+try:
+    from snowflake.ml.runtime_cluster import get_ray_dashboard_url
+
+    dashboard_url = get_ray_dashboard_url()
+    print(f"✅ Ray Dashboard: {dashboard_url}")
+except Exception as e:
+    print("⚠️ No se pudo obtener la URL del Ray Dashboard.")
+    print(f"   Detalle: {str(e)[:200]}")
+
+# %% [markdown]
+# ### 5c. Ejecutar MMT y monitorear
+
+# %%
+print("\n" + "=" * 80)
 print("🚀 STARTING MANY MODEL TRAINING (MMT) - 16 MODELS")
 print("=" * 80)
 print(
@@ -645,19 +716,34 @@ training_run = trainer.run(
     run_id=f"uni_box_regression_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
 )
 
-print("\n⏳ Training in progress... Monitoring completion...\n")
+print(f"\n✅ Training started. Run ID: {training_run.run_id}")
+print("   Monitorea en Ray Dashboard (celda 5b) o ejecuta la celda 5d cuando quieras esperar.")
+print("   Para no bloquear: ejecuta solo hasta aquí y más tarde vuelve a ejecutar la celda 5d.\n")
 
-# Monitor with timeout
+# %% [markdown]
+# ### 5d. (Opcional) Esperar a que termine el MMT
+#
+# **No hace falta esperar aquí.** Puedes cerrar/continuar y volver más tarde.
+# - Monitorea en **Ray Dashboard** (celda 5b).
+# - Cuando quieras bloquear hasta que termine: ejecuta esta celda.
+# - Si pones `MMT_MAX_WAIT = 7200` (2 h) y ejecutas esta celda, esperará hasta 2 h o hasta que termine.
+# - Si se cumple el timeout sin terminar, vuelve a ejecutar esta celda (con mismo o mayor `MMT_MAX_WAIT`).
+
+# %%
 import time as time_module
 
-max_wait = 1800  # 30 minutes max
-check_interval = 10  # Check every 10 seconds
+# Ajusta según quieras: tiempo máximo que esta celda esperará (segundos)
+# 600 = 10 min (solo para ver algo de progreso); 7200 = 2 h (esperar hasta el final)
+MMT_MAX_WAIT = 600
+MMT_CHECK_INTERVAL = 30  # Log cada 30 s (no cada 10 s)
+
 elapsed = 0
 completed = False
+run_start = start_time
 
-while elapsed < max_wait:
-    time_module.sleep(check_interval)
-    elapsed += check_interval
+while elapsed < MMT_MAX_WAIT:
+    time_module.sleep(MMT_CHECK_INTERVAL)
+    elapsed += MMT_CHECK_INTERVAL
 
     try:
         done_count = 0
@@ -669,7 +755,7 @@ while elapsed < max_wait:
                 done_count += 1
 
         print(
-            f"⏱️  {elapsed}s elapsed - Progress: {done_count}/{total_count} models completed",
+            f"⏱️  {elapsed}s - Progress: {done_count}/{total_count} models completed",
             end="\r",
         )
 
@@ -677,27 +763,34 @@ while elapsed < max_wait:
             print("\n✅ All models completed!" + " " * 50)
             completed = True
             break
-    except:
-        print(f"⏱️  {elapsed}s elapsed - Waiting for status update...", end="\r")
+    except Exception:
+        print(f"⏱️  {elapsed}s - Waiting for status update...", end="\r")
 
 if not completed:
-    print("\n⏱️  Timeout reached - Verifying completion via stage..." + " " * 30)
-    stage_files = session.sql(
-        f"LIST @BD_AA_DEV.SC_MODELS_BMX.MMT_MODELS PATTERN='.*{training_run.run_id}.*'"
-    ).collect()
-    if len(stage_files) > 0:
-        print(
-            f"✅ Found {len(stage_files)} model files in stage - Training completed successfully!"
-        )
-        completed = True
+    print("\n" + "=" * 80)
+    print("⏱️  Timeout de espera alcanzado (training puede seguir en segundo plano).")
+    print("   → Revisa el Ray Dashboard (celda 5b) para ver progreso.")
+    print("   → Para esperar hasta el final: pon MMT_MAX_WAIT = 7200 (o más) y vuelve a ejecutar esta celda.")
+    print("   → Cuando todo haya terminado, ejecuta las celdas 6 y 7 (resultados y registro).")
+    print("=" * 80)
+    # Verificación rápida por stage
+    try:
+        stage_files = session.sql(
+            f"LIST @BD_AA_DEV.SC_MODELS_BMX.MMT_MODELS PATTERN='.*{training_run.run_id}.*'"
+        ).collect()
+        if len(stage_files) >= 16:
+            print(f"\n✅ Hay {len(stage_files)} archivos en stage - training probablemente completado.")
+            completed = True
+    except Exception:
+        pass
+else:
+    print("\n" + "=" * 80)
+    print("✅ TRAINING COMPLETE!")
+    print("=" * 80)
 
 end_time = time.time()
-elapsed_minutes = (end_time - start_time) / 60
-
-print("\n" + "=" * 80)
-print(f"✅ TRAINING COMPLETE! Status: {'COMPLETED' if completed else 'UNKNOWN'}")
-print("=" * 80)
-print(f"\n⏱️  Total training time: {elapsed_minutes:.2f} minutes")
+elapsed_minutes = (end_time - run_start) / 60
+print(f"\n⏱️  Tiempo en esta celda: {elapsed_minutes:.2f} min")
 
 # %% [markdown]
 # ## 6. Review Training Results
@@ -734,6 +827,7 @@ print("=" * 80)
 version_date = datetime.now().strftime("%Y%m%d_%H%M")
 registered_models = {}
 
+# %% Registrar cada modelo por grupo
 for partition_id in training_run.partition_details:
     details = training_run.partition_details[partition_id]
 
@@ -757,7 +851,7 @@ for partition_id in training_run.partition_details:
 
             # Prepare sample input from this group
             sample_input = (
-                training_df.filter(training_df["stats_ntile_group"] == partition_id)
+                training_df.filter(training_df[PARTITION_COL] == partition_id)
                 .select(model.feature_cols)
                 .limit(5)
             )
@@ -842,6 +936,26 @@ for partition_id, model_info in registered_models.items():
 print("\n✅ All production aliases configured!")
 
 # %% [markdown]
+# ## 8b. Scale cluster down
+
+# %%
+print("\n" + "=" * 80)
+print("📉 SCALING CLUSTER DOWN")
+print("=" * 80)
+
+try:
+    from snowflake.ml.runtime_cluster import scale_cluster
+
+    print("⏳ Reduciendo cluster a 1 contenedor...")
+    scale_cluster(
+        expected_cluster_size=1
+    )
+    print("✅ Cluster reducido a 1 contenedor")
+except Exception as e:
+    print(f"⚠️  Error al reducir cluster: {str(e)[:200]}")
+    print("   El cluster puede seguir escalado...")
+
+# %% [markdown]
 # ## 9. Summary
 
 # %%
@@ -873,3 +987,4 @@ print(
 )
 
 print("\n" + "=" * 80)
+

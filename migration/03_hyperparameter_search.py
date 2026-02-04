@@ -212,17 +212,14 @@ for param, dist in SEARCH_SPACES["XGBRegressor"].items():
         else:
             print(f"   {param}: uniform({dist.low:.2f}, {dist.high:.2f})")
 
-# Number of trials for Random Search (reduced per group for efficiency)
-num_trials = 30  # Reduced from 50 since we're doing 16 groups
+# Number of trials for Random Search
+num_trials = 10
+max_concurrent_trials = 4
 print(f"\n🔢 Random Search trials per group: {num_trials}")
+print(f"   Max concurrent trials per group: {max_concurrent_trials}")
 
 # Sample rate per group for hyperparameter search
-# Options:
-#   - 1.0 = Use full group (most accurate but slower)
-#   - 0.5 = Use 50% of group (balanced)
-#   - 0.1 = Use 10% of group (faster, less accurate)
-# Note: For large datasets, using full group (1.0) is recommended for better hyperparameter tuning
-SAMPLE_RATE_PER_GROUP = 0.2
+SAMPLE_RATE_PER_GROUP = 0.1
 print(f"📊 Sample rate per group: {SAMPLE_RATE_PER_GROUP*100:.0f}%")
 if SAMPLE_RATE_PER_GROUP < 1.0:
     print(
@@ -232,7 +229,49 @@ else:
     print(f"   ✅ Using full group data for optimal hyperparameter search")
 
 # %% [markdown]
-# ## 4. Perform Hyperparameter Search Per Group
+# ### 3c. (Opcional) Ver Ray Dashboard
+#
+# Usa esta celda en Notebooks de Snowflake para obtener la URL del Ray Dashboard
+# asociado al runtime actual. Copia y pega la URL en tu navegador.
+
+# %%
+try:
+    from snowflake.ml.runtime_cluster import get_ray_dashboard_url
+
+    dashboard_url = get_ray_dashboard_url()
+    print(f"✅ Access the Ray Dashboard here: {dashboard_url}")
+except Exception as e:
+    print("⚠️ No se pudo obtener la URL del Ray Dashboard.")
+    print(f"   Detalle: {str(e)[:200]}")
+
+# %% [markdown]
+# ## 4. Scale Cluster for HPO
+
+# %%
+print("\n" + "=" * 80)
+print("📈 SCALING CLUSTER FOR HPO")
+print("=" * 80)
+
+try:
+    from snowflake.ml.runtime_cluster import scale_cluster
+
+    print("⏳ Escalando cluster a 4 contenedores...")
+    scale_cluster(
+        expected_cluster_size=4,
+        options={
+            "block_until_min_cluster_size": 2  # Return when at least 2 nodes ready
+        }
+    )
+    print("✅ Cluster escalado a 4 contenedores")
+except Exception as e:
+    print(f"⚠️  Error al escalar cluster: {str(e)[:200]}")
+    print("   Continuando con el cluster actual...")
+
+# %% [markdown]
+# ## 5. Perform Hyperparameter Search Per Group
+
+# %% [markdown]
+# ### 5a. Setup: ML Experiments, tabla (si aplica), features y all_results
 
 # %%
 print("\n" + "=" * 80)
@@ -304,23 +343,34 @@ def _get_target_column(df):
     return "uni_box_week"
 
 
+def _get_feature_cols_numeric(df, excluded_cols, target_col):
+    """Columnas que son features numéricas: excluye metadata/target (case-insensitive) y solo int/float/bool (Snowflake ML)."""
+    excluded_upper = {str(x).upper() for x in list(excluded_cols) + [target_col]}
+    return [
+        col
+        for col in df.columns
+        if str(col).upper() not in excluded_upper
+        and getattr(df[col].dtype, "kind", "O") in "iufb"
+    ]
+
+
 # Get feature columns from first group (all groups should have same features)
 sample_group_df = train_df.filter(train_df["stats_ntile_group"] == groups_list[0])
 sample_pandas = sample_group_df.limit(1).to_pandas()
-feature_cols = [
-    col
-    for col in sample_pandas.columns
-    if col not in excluded_cols + [_get_target_column(sample_pandas)]
-]
+target_col_sample = _get_target_column(sample_pandas)
+feature_cols = _get_feature_cols_numeric(sample_pandas, excluded_cols, target_col_sample)
 
 print(f"\n📋 Features ({len(feature_cols)}):")
 for col in sorted(feature_cols):
     print(f"   - {col}")
 
-# Dictionary to store all results
+# Dictionary to store all results (se llena en el loop de 4c)
 all_results = {}
 
+# %% [markdown]
+# ### 4b. Definiciones: función de entrenamiento para el Tuner y HPO por grupo
 
+# %%
 def create_train_func_for_tuner(feature_cols, model_type, target_col):
     """
     Create a training function for the Tuner (XGBRegressor, LGBMRegressor or SGDRegressor).
@@ -345,10 +395,10 @@ def create_train_func_for_tuner(feature_cols, model_type, target_col):
 
         train_pd = dm["train"].to_pandas()
         test_pd = dm["test"].to_pandas()
-        X_train = train_pd[feature_cols].fillna(0)
-        y_train = train_pd[target_col].fillna(0)
-        X_val = test_pd[feature_cols].fillna(0)
-        y_val = test_pd[target_col].fillna(0)
+        # Snowflake ML usa fit(dataset) con un solo DataFrame; input_cols y label_cols en el modelo
+        train_dataset = train_pd[feature_cols + [target_col]].fillna(0)
+        test_features = test_pd[feature_cols].fillna(0)
+        y_val = test_pd[target_col].fillna(0).values
 
         model_params = params.copy()
         model_params["random_state"] = 42
@@ -359,29 +409,40 @@ def create_train_func_for_tuner(feature_cols, model_type, target_col):
             model_params["n_jobs"] = -1
             model_params["objective"] = "reg:squarederror"
             model_params["eval_metric"] = "rmse"
-            model = XGBRegressor(**model_params)
+            model = XGBRegressor(
+                input_cols=feature_cols, label_cols=[target_col], **model_params
+            )
         elif model_type == "LGBMRegressor":
             from snowflake.ml.modeling.lightgbm import LGBMRegressor
 
             model_params["n_jobs"] = -1
             model_params["verbosity"] = -1
-            model = LGBMRegressor(**model_params)
+            model = LGBMRegressor(
+                input_cols=feature_cols, label_cols=[target_col], **model_params
+            )
         elif model_type == "SGDRegressor":
             from snowflake.ml.modeling.linear_model import SGDRegressor
 
             model_params.setdefault("penalty", "l2")
             model_params.setdefault("learning_rate", "invscaling")
-            model = SGDRegressor(**model_params)
+            model = SGDRegressor(
+                input_cols=feature_cols, label_cols=[target_col], **model_params
+            )
         else:
             from snowflake.ml.modeling.xgboost import XGBRegressor
 
             model_params["n_jobs"] = -1
             model_params["objective"] = "reg:squarederror"
             model_params["eval_metric"] = "rmse"
-            model = XGBRegressor(**model_params)
+            model = XGBRegressor(
+                input_cols=feature_cols, label_cols=[target_col], **model_params
+            )
 
-        model.fit(X_train, y_train)
-        y_val_pred = model.predict(X_val)
+        model.fit(train_dataset)
+        pred_result = model.predict(test_features)
+        pred_df = pred_result.to_pandas() if hasattr(pred_result, "to_pandas") else pred_result
+        out_col = model.get_output_cols()[0]
+        y_val_pred = np.asarray(pred_df[out_col])
         val_rmse = np.sqrt(mean_squared_error(y_val, y_val_pred))
         val_mae = mean_absolute_error(y_val, y_val_pred)
         tuner_context.report(metrics={"rmse": val_rmse, "mae": val_mae}, model=model)
@@ -449,10 +510,8 @@ def run_hyperparameter_search_for_one_group(group_name, group_df):
     ]
 
     target_col = _get_target_column(sampled_df)
-    # Get feature columns
-    feature_cols_list = [
-        col for col in sampled_df.columns if col not in excluded_cols + [target_col]
-    ]
+    # Get feature columns (solo numéricas; Snowflake ML exige int/float/bool)
+    feature_cols_list = _get_feature_cols_numeric(sampled_df, excluded_cols, target_col)
 
     # Prepare X and y
     X = sampled_df[feature_cols_list].fillna(0)
@@ -474,11 +533,12 @@ def run_hyperparameter_search_for_one_group(group_name, group_df):
 
     # Prepare data for Tuner using DataConnector
     # DataConnector.from_dataframe() expects Snowpark DataFrames, not Pandas
-    train_data = X_train.copy()
-    train_data[target_col] = y_train.values
+    # Usar copia explícita e índices reseteados para evitar advertencias de Pandas
+    train_data = X_train.reset_index(drop=True).copy()
+    train_data[target_col] = np.asarray(y_train)
 
-    val_data = X_val.copy()
-    val_data[target_col] = y_val.values
+    val_data = X_val.reset_index(drop=True).copy()
+    val_data[target_col] = np.asarray(y_val)
 
     train_snowpark = session.create_dataframe(train_data)
     val_snowpark = session.create_dataframe(val_data)
@@ -502,7 +562,7 @@ def run_hyperparameter_search_for_one_group(group_name, group_df):
         mode="min",
         search_alg=RandomSearch(),
         num_trials=num_trials,
-        max_concurrent_trials=1,
+        max_concurrent_trials=max_concurrent_trials,
     )
 
     # Create and run Tuner
@@ -515,15 +575,30 @@ def run_hyperparameter_search_for_one_group(group_name, group_df):
 
         elapsed_time = time.time() - start_time
 
-        # Get best results
+        # Get best results (best_result is a single-row pd.DataFrame: config/* = hyperparams, other cols = metrics)
         best_result = results.best_result
-        best_params = best_result.hyperparameters
-        best_rmse = best_result.metrics["rmse"]
-        best_mae = best_result.metrics.get("mae", None)
+        config_cols = [c for c in best_result.columns if str(c).startswith("config/")]
+
+        def _to_native(v):
+            if hasattr(v, "item"):
+                return v.item()
+            return v
+
+        best_params = {
+            str(c).replace("config/", ""): _to_native(best_result[c].iloc[0])
+            for c in config_cols
+        }
+        best_rmse = float(best_result["rmse"].iloc[0]) if "rmse" in best_result.columns else None
+        best_mae = float(best_result["mae"].iloc[0]) if "mae" in best_result.columns else None
+        if best_rmse is None:
+            raise ValueError("TunerResults best_result has no 'rmse' metric column")
         best_model = results.best_model
 
         # Evaluate best model on validation set again for consistency
-        y_val_pred = best_model.predict(X_val)
+        pred_result = best_model.predict(X_val)
+        pred_df = pred_result.to_pandas() if hasattr(pred_result, "to_pandas") else pred_result
+        out_col = best_model.get_output_cols()[0]
+        y_val_pred = np.asarray(pred_df[out_col])
         val_rmse = np.sqrt(mean_squared_error(y_val, y_val_pred))
         val_mae = mean_absolute_error(y_val, y_val_pred)
 
@@ -663,6 +738,10 @@ def run_hyperparameter_search_for_one_group(group_name, group_df):
         return DummyResult()
 
 
+# %% [markdown]
+# ### 5c. Ejecutar búsqueda de hiperparámetros (loop por grupo)
+
+# %%
 # Run hyperparameter search per group (loop; no MMT to avoid Ray serialization)
 # Results are saved to BD_AA_DEV.SC_MODELS_BMX.HYPERPARAMETER_RESULTS and/or ML Experiments.
 print("\n" + "=" * 80)
@@ -772,7 +851,27 @@ else:
     overall_stats.show()
 
 # %% [markdown]
-# ## 6. Summary
+# ## 7. Scale Cluster Down
+
+# %%
+print("\n" + "=" * 80)
+print("📉 SCALING CLUSTER DOWN")
+print("=" * 80)
+
+try:
+    from snowflake.ml.runtime_cluster import scale_cluster
+
+    print("⏳ Reduciendo cluster a 1 contenedor...")
+    scale_cluster(
+        expected_cluster_size=1
+    )
+    print("✅ Cluster reducido a 1 contenedor")
+except Exception as e:
+    print(f"⚠️  Error al reducir cluster: {str(e)[:200]}")
+    print("   El cluster puede seguir escalado...")
+
+# %% [markdown]
+# ## 8. Summary
 
 # %%
 print("\n" + "=" * 80)
