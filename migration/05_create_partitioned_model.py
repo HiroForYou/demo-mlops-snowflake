@@ -56,7 +56,8 @@ if not loaded_models:
     raise ValueError("No models loaded. Run 04_many_model_training.py first.")
 if len(loaded_models) < len(groups_list):
     print(f"⚠️  {len(loaded_models)}/{len(groups_list)} modelos cargados")
-print(f"\n✅ {len(loaded_models)} modelos, {len(feature_cols)} features")
+versions_loaded = {getattr(m["model_version"], "name", None) for m in loaded_models.values()}
+print(f"\n✅ {len(loaded_models)} modelos, {len(feature_cols)} features (alias PRODUCTION → {versions_loaded or 'N/A'})")
 
 # %% [markdown]
 # ## 2. Define Partitioned Model Class
