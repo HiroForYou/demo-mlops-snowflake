@@ -1,19 +1,10 @@
 # %% [markdown]
-# # Migration: Create Partitioned Model
-#
-# ## Overview
-# This script creates a partitioned model from the trained group-specific models (LGBM/XGB/SGD).
-# It combines all per-group models into one partitioned model to enable
-# partitioned inference syntax for consistency and future scalability.
-#
-# ## What We'll Do:
-# 1. Load trained model from Model Registry
-# 2. Create CustomModel class with partitioned API
-# 3. Register partitioned model
-# 4. Test partitioned inference
+# # Modelo particionado (16 modelos de 04)
+# Carga los modelos por grupo del Registry, crea CustomModel con API particionada y lo registra.
 
 # %%
 from snowflake.snowpark.context import get_active_session
+from snowflake.snowpark.functions import col, first, lit
 from snowflake.ml.registry import Registry
 from snowflake.ml.model import custom_model, task
 import pandas as pd
@@ -21,28 +12,16 @@ import numpy as np
 from datetime import datetime
 
 session = get_active_session()
-
-# Set context
 session.sql("USE DATABASE BD_AA_DEV").collect()
 session.sql("USE SCHEMA SC_STORAGE_BMX_PS").collect()
-
-registry = Registry(
-    session=session, database_name="BD_AA_DEV", schema_name="SC_MODELS_BMX"
-)
-
-print("✅ Connected to Snowflake")
-print(f"   Database: {session.get_current_database()}")
-print(f"   Schema: {session.get_current_schema()}")
+registry = Registry(session=session, database_name="BD_AA_DEV", schema_name="SC_MODELS_BMX")
+print(f"✅ {session.get_current_database()}.{session.get_current_schema()}")
 
 # %% [markdown]
-# ## 1. Get All Groups and Load Trained Models
+# ## 1. Cargar los 16 modelos (PRODUCTION)
 
 # %%
-print("\n" + "=" * 80)
-print("🔍 LOADING ALL 16 TRAINED MODELS")
-print("=" * 80)
 
-# Get all groups from training data
 groups_df = session.sql(
     """
     SELECT DISTINCT stats_ntile_group AS GROUP_NAME
@@ -51,58 +30,33 @@ groups_df = session.sql(
     ORDER BY stats_ntile_group
 """
 )
-
 groups_list = [row["GROUP_NAME"] for row in groups_df.collect()]
-print(f"\n📊 Found {len(groups_list)} groups to load")
+print(f"\n📊 Grupos: {len(groups_list)}")
 
-# Load all models
 loaded_models = {}
 feature_cols = None
 
 for group_name in groups_list:
     model_name = f"uni_box_regression_{group_name.lower()}"
-
     try:
         model_ref = registry.get_model(model_name)
         model_version = model_ref.version("PRODUCTION")
-
-        # Load the model
         native_model = model_version.load()
-
-        # Get feature columns from first model
         if feature_cols is None:
-            if hasattr(native_model, "feature_cols"):
-                feature_cols = native_model.feature_cols
-            else:
-                sample_input = model_version.sample_input_data
-                if sample_input:
-                    feature_cols = sample_input.columns
-                else:
-                    raise ValueError("Cannot determine feature columns from model")
-
-        loaded_models[group_name] = {
-            "model": native_model,
-            "model_version": model_version,
-            "model_name": model_name,
-        }
-
-        print(f"✅ {group_name}: {model_name} loaded")
-
+            feature_cols = getattr(native_model, "feature_cols", None)
+            if not feature_cols:
+                raise ValueError("Model has no feature_cols; run 04 first.")
+        loaded_models[group_name] = {"model": native_model, "model_version": model_version, "model_name": model_name}
+        ver_name = getattr(model_version, "name", str(model_version))
+        print(f"✅ {group_name} (versión: {ver_name})")
     except Exception as e:
-        print(f"❌ {group_name}: Error loading model - {str(e)[:100]}")
-        print(
-            f"   Please ensure all 16 models were trained in 04_many_model_training.py"
-        )
+        print(f"❌ {group_name}: {str(e)[:100]}")
 
-if len(loaded_models) == 0:
-    raise ValueError("No models loaded! Please run 04_many_model_training.py first")
-
+if not loaded_models:
+    raise ValueError("No models loaded. Run 04_many_model_training.py first.")
 if len(loaded_models) < len(groups_list):
-    print(f"\n⚠️  WARNING: Only {len(loaded_models)}/{len(groups_list)} models loaded")
-    print("   Partitioned model will only include loaded models")
-
-print(f"\n✅ Loaded {len(loaded_models)} models")
-print(f"   Features: {len(feature_cols)}")
+    print(f"⚠️  {len(loaded_models)}/{len(groups_list)} modelos cargados")
+print(f"\n✅ {len(loaded_models)} modelos, {len(feature_cols)} features")
 
 # %% [markdown]
 # ## 2. Define Partitioned Model Class
@@ -114,98 +68,53 @@ print("=" * 80)
 
 
 class PartitionedUniBoxModel(custom_model.CustomModel):
-    """
-    Partitioned model for uni_box_week regression.
-    Routes predictions to the correct sub-model based on stats_ntile_group.
-    """
+    """Modelo particionado: enruta predicciones por stats_ntile_group."""
 
     def __init__(self, model_context):
         super().__init__(model_context)
-        # Feature columns will be determined from the models
         self.feature_cols = None
 
     @custom_model.partitioned_api
     def predict(self, input_df: pd.DataFrame) -> pd.DataFrame:
-        """
-        Predict uni_box_week using partitioned API.
-        Routes to correct sub-model based on stats_ntile_group.
-
-        Args:
-            input_df: DataFrame with features and stats_ntile_group column
-
-        Returns:
-            DataFrame with predictions
-        """
+        """Predicción por grupo; enruta según stats_ntile_group."""
         if len(input_df) == 0:
-            return pd.DataFrame(
-                columns=["customer_id", "stats_ntile_group", "predicted_uni_box_week"]
-            )
+            return pd.DataFrame(columns=["customer_id", "stats_ntile_group", "predicted_uni_box_week"])
 
-        # Get the group name from input
-        group_name = input_df["stats_ntile_group"].iloc[0]
+        part_col = "stats_ntile_group" if "stats_ntile_group" in input_df.columns else "STATS_NTILE_GROUP"
+        group_name = input_df[part_col].iloc[0]
 
-        # Create key for model lookup (match the key used in ModelContext)
         model_key = f"group_{group_name.lower()}"
-
-        # Get the model for this group
         try:
             model = self.context.model_ref(model_key)
-        except Exception as e:
-            # Fallback: try alternative key format
+        except Exception:
             try:
-                model_key_alt = group_name.lower()
-                model = self.context.model_ref(model_key_alt)
-            except:
-                raise ValueError(
-                    f"Model not found for group: {group_name}. Available keys: {list(self.context.models.keys())}"
-                )
+                model = self.context.model_ref(group_name.lower())
+            except Exception:
+                raise ValueError(f"Model not found for group: {group_name}. Keys: {list(self.context.models.keys())}")
 
-        # Determine feature columns if not set
         if self.feature_cols is None:
-            if hasattr(model, "feature_cols"):
-                self.feature_cols = model.feature_cols
-            else:
-                # Infer from input (exclude metadata columns)
-                metadata_cols = [
-                    "customer_id",
-                    "brand_pres_ret",
-                    "week",
-                    "group",
-                    "stats_group",
-                    "percentile_group",
-                    "stats_ntile_group",
-                    "FEATURE_TIMESTAMP",
-                ]
-                self.feature_cols = [
-                    col for col in input_df.columns if col not in metadata_cols
-                ]
+            self.feature_cols = getattr(model, "feature_cols", None)
+            if not self.feature_cols:
+                meta = {"customer_id", "brand_pres_ret", "week", "group", "stats_group", "percentile_group", "stats_ntile_group", "STATS_NTILE_GROUP", "FEATURE_TIMESTAMP"}
+                self.feature_cols = [c for c in input_df.columns if c not in meta]
 
-        # Prepare features
-        X = input_df[self.feature_cols].fillna(0)
+        X = input_df[self.feature_cols].fillna(0).astype(np.float64, errors="ignore")
+        pred_out = model.predict(X)
 
-        # Make predictions
-        predictions = model.predict(X)
+        if isinstance(pred_out, pd.DataFrame):
+            pred_col = next((c for c in pred_out.columns if "PREDICT" in c.upper() or "OUTPUT" in c.upper()), pred_out.columns[0])
+            predictions = np.asarray(pred_out[pred_col], dtype=np.float64).ravel()
+        elif hasattr(pred_out, "flatten"):
+            predictions = np.asarray(pred_out).flatten()
+        else:
+            predictions = np.asarray(pred_out).ravel()
 
-        # Flatten if needed
-        if hasattr(predictions, "flatten"):
-            predictions = predictions.flatten()
-        elif isinstance(predictions, np.ndarray) and len(predictions.shape) > 1:
-            predictions = predictions.ravel()
-
-        # Return predictions with customer_id and group
-        result = pd.DataFrame(
-            {
-                "customer_id": (
-                    input_df["customer_id"].values
-                    if "customer_id" in input_df.columns
-                    else range(len(predictions))
-                ),
-                "stats_ntile_group": group_name,
-                "predicted_uni_box_week": predictions,
-            }
-        )
-
-        return result
+        cust = input_df["customer_id"].values if "customer_id" in input_df.columns else np.arange(len(predictions))
+        return pd.DataFrame({
+            "customer_id": cust,
+            "stats_ntile_group": group_name,
+            "predicted_uni_box_week": predictions,
+        })
 
 
 print("✅ PartitionedUniBoxModel class defined")
@@ -218,42 +127,30 @@ print("\n" + "=" * 80)
 print("📦 CREATING PARTITIONED MODEL")
 print("=" * 80)
 
-# Create ModelContext with all 16 models
-# Key format: group_{group_name} to match the lookup in predict()
 models_dict = {}
 for group_name, model_info in loaded_models.items():
     model_key = f"group_{group_name.lower()}"
     models_dict[model_key] = model_info["model"]
     print(f"   Added {group_name} → {model_key}")
-
 print(f"\n✅ ModelContext created with {len(models_dict)} models")
 
-# Create ModelContext
 model_context = custom_model.ModelContext(models=models_dict)
-
-# Create partitioned model instance
 partitioned_model = PartitionedUniBoxModel(model_context=model_context)
 print("✅ Partitioned model created")
 
 # %% [markdown]
-# ## 4. Prepare Sample Input
+# ## 4. Sample input (opcional, para inspección)
 
 # %%
-print("\n📝 Preparing sample input...")
-
-# Get sample input from training data (one per group)
 training_df = session.table("BD_AA_DEV.SC_STORAGE_BMX_PS.TRAIN_DATASET_CLEANED")
-
-# Prepare sample with all required columns (one row per group)
 sample_input = (
     training_df.select("customer_id", "stats_ntile_group", *feature_cols)
     .filter(training_df["stats_ntile_group"].isin(list(loaded_models.keys())))
     .group_by("stats_ntile_group")
-    .agg(*[F.first(col).alias(col) for col in ["customer_id"] + feature_cols])
+    .agg(*[first(col(c)).alias(c) for c in ["customer_id"] + feature_cols])
     .select("customer_id", "stats_ntile_group", *feature_cols)
     .limit(min(16, len(loaded_models)))
 )
-
 print(f"✅ Sample input prepared: {sample_input.count()} rows (one per group)")
 
 # %% [markdown]
@@ -282,14 +179,11 @@ try:
             "model_type": "mixed",
             "groups": ",".join(sorted(loaded_models.keys())),
         },
-        sample_input_data=sample_input,
         task=task.Task.TABULAR_REGRESSION,
         options={"function_type": "TABLE_FUNCTION"},
     )
 
     print("\n✅ Partitioned model registered successfully!")
-
-    # Set PRODUCTION alias
     mv.set_alias("PRODUCTION")
     print(f"🏷️  Alias 'PRODUCTION' configured")
 
@@ -335,21 +229,18 @@ print("\n" + "=" * 80)
 print("🧪 TESTING PARTITIONED INFERENCE")
 print("=" * 80)
 
-# Create a dummy partition column for testing
 test_data = (
     training_df.select("customer_id", *feature_cols)
     .limit(10)
-    .with_column("dummy_partition", F.lit("ALL"))
+    .with_column("dummy_partition", lit("ALL"))
 )
 
-# Save test data temporarily
 test_data.write.mode("overwrite").save_as_table(
     "BD_AA_DEV.SC_STORAGE_BMX_PS.TEST_INFERENCE_TEMP"
 )
 
 print("\n📊 Test data prepared: 10 samples")
 
-# Test partitioned inference SQL
 test_sql = """
 WITH test_predictions AS (
     SELECT 
@@ -410,7 +301,6 @@ except Exception as e:
         "   The model is registered correctly, feature order will be handled in inference script"
     )
 
-# Clean up test table
 session.sql(
     "DROP TABLE IF EXISTS BD_AA_DEV.SC_STORAGE_BMX_PS.TEST_INFERENCE_TEMP"
 ).collect()

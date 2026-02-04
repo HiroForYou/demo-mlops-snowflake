@@ -1,17 +1,6 @@
 # %% [markdown]
-# # Migration: Many Model Training (MMT) - 16 Models (LGBMRegressor, XGBRegressor, SGDRegressor)
-#
-# ## Overview
-# This script trains **16 regression models** (one per stats_ntile_group) using Many Model Training (MMT).
-# Model type per group: LGBMRegressor, XGBRegressor, or SGDRegressor (see GROUP_MODEL).
-# Each model is trained with group-specific hyperparameters from script 03.
-#
-# ## What We'll Do:
-# 1. Load best hyperparameters per group from hyperparameter search
-# 2. Define training function for MMT (with group-specific hyperparameters)
-# 3. Execute MMT training with partition_by="stats_ntile_group"
-# 4. Register 16 models in Model Registry (one per group)
-# 5. Create group-to-model mapping
+# # MMT: 16 modelos (LGBM/XGB/SGD por stats_ntile_group)
+# Hiperparámetros por grupo desde script 03 → entrenar → registrar en Model Registry.
 
 # %%
 from snowflake.snowpark.context import get_active_session
@@ -26,22 +15,14 @@ import json
 
 session = get_active_session()
 
-# Set context
 session.sql("USE DATABASE BD_AA_DEV").collect()
 session.sql("USE SCHEMA SC_STORAGE_BMX_PS").collect()
+print(f"✅ {session.get_current_database()}.{session.get_current_schema()}")
 
-print(f"✅ Connected to Snowflake")
-print(f"   Database: {session.get_current_database()}")
-print(f"   Schema: {session.get_current_schema()}")
+USE_CLEANED_TABLES = False
+FEATURES_TABLE = "BD_AA_DEV.SC_FEATURES_BMX.UNI_BOX_FEATURES"
+MMT_SAMPLE_FRACTION = 0.01  # None = 100%
 
-# Configuración:
-# - Si no tienes permisos para FeatureView/Dynamic Tables, usa tablas limpias o tabla de features materializada.
-USE_CLEANED_TABLES = False  # True = TRAIN_DATASET_CLEANED, False = intentar tabla de features materializada
-FEATURES_TABLE = (
-    "BD_AA_DEV.SC_FEATURES_BMX.UNI_BOX_FEATURES"  # creada por 02_feature_store_setup.py
-)
-
-# Un solo objeto: grupo -> nombre de clase Snowflake ML (snowflake.ml.modeling.*)
 GROUP_MODEL = {
     "group_stat_0_1": "LGBMRegressor",
     "group_stat_0_2": "LGBMRegressor",
@@ -63,33 +44,19 @@ GROUP_MODEL = {
 _DEFAULT_MODEL = "XGBRegressor"
 
 # %% [markdown]
-# ## 1. Setup Model Registry & Staging
+# ## 1. Registry y stage
 
 # %%
-# CREATE SCHEMA comentado (puede requerir permisos)
-# session.sql("CREATE SCHEMA IF NOT EXISTS BD_AA_DEV.SC_MODELS_BMX").collect()
 session.sql("CREATE STAGE IF NOT EXISTS BD_AA_DEV.SC_MODELS_BMX.MMT_MODELS").collect()
-
-registry = Registry(
-    session=session, database_name="BD_AA_DEV", schema_name="SC_MODELS_BMX"
-)
-
-print("✅ Model Registry initialized")
-print("✅ Stage for MMT models created")
+registry = Registry(session=session, database_name="BD_AA_DEV", schema_name="SC_MODELS_BMX")
+print("✅ Registry + stage listos")
 
 # %% [markdown]
-# ## 2. Load Best Hyperparameters Per Group
+# ## 2. Hiperparámetros por grupo (Experiments o tabla)
 
 # %%
-print("\n" + "=" * 80)
-print("📊 LOADING BEST HYPERPARAMETERS PER GROUP")
-print("=" * 80)
-
-# Try to load from ML Experiments first, fallback to table
 hyperparams_by_group = {}
 experiments_loaded = False
-
-# Get all groups that need hyperparameters
 all_groups_from_data = session.sql(
     """
     SELECT DISTINCT stats_ntile_group
@@ -101,13 +68,9 @@ all_groups_from_data = session.sql(
 
 expected_groups = [row["STATS_NTILE_GROUP"] for row in all_groups_from_data]
 
-# Try loading from ML Experiments
-print("\n🔬 Attempting to load from ML Experiments...")
+print("\n🔬 Cargando desde ML Experiments...")
 try:
     exp_tracking = ExperimentTracking(session)
-
-    # Try to find the most recent experiment
-    # Note: This is a simplified approach - in production you might want to specify experiment name
     from datetime import datetime, timedelta
 
     today = datetime.now().strftime("%Y%m%d")
@@ -135,11 +98,9 @@ try:
             experiments_loaded = False
 
     if experiments_loaded:
-        # Use ExperimentTracking API methods via SQL SHOW commands
         try:
-            print(f"   📋 Listing runs from experiment: {experiment_name}")
+            print(f"   📋 Runs en experiment: {experiment_name}")
 
-            # Step 1: List all runs in the experiment using SHOW RUNS
             runs_query = f"SHOW RUNS IN EXPERIMENT {experiment_name}"
             runs_df = session.sql(runs_query)
             runs_list = runs_df.collect()
@@ -150,8 +111,7 @@ try:
             else:
                 print(f"   ✅ Found {len(runs_list)} runs in experiment")
 
-                # Step 2: For each run, get parameters and metrics
-                runs_by_group = {}  # group_name -> best run info
+                runs_by_group = {}
 
                 for run in runs_list:
                     run_name = run["name"]
@@ -272,15 +232,12 @@ except Exception as e:
     experiments_loaded = False
 
 # %% [markdown]
-# ### 2b. Fallback a tabla (si no hay Experiments o faltan grupos)
+# ### 2b. Fallback a tabla
 
 # %%
-# Fallback to table ONLY if Experiments didn't work or didn't have all groups
 if not experiments_loaded or len(hyperparams_by_group) < len(expected_groups):
-    print("\n📋 Loading from table (HYPERPARAMETER_RESULTS) - Fallback mode...")
-    print("   Note: Table is only used when ML Experiments is not available")
+    print("\n📋 Fallback: HYPERPARAMETER_RESULTS")
 
-    # Check if table exists
     table_exists = False
     try:
         check_table = session.sql(
@@ -297,7 +254,6 @@ if not experiments_loaded or len(hyperparams_by_group) < len(expected_groups):
         table_exists = False
 
     if table_exists:
-        # Get most recent hyperparameter search results per group from table
         hyperparams_df = session.sql(
             """
             WITH latest_searches AS (
@@ -332,18 +288,15 @@ if not experiments_loaded or len(hyperparams_by_group) < len(expected_groups):
         if len(hyperparams_results) > 0:
             print(f"   ✅ Loaded {len(hyperparams_results)} groups from table")
 
-            # Update or add to hyperparams_by_group
             for result in hyperparams_results:
                 group_name = result["GROUP_NAME"]
                 best_params_json = result["BEST_PARAMS"]
 
-                # Parse hyperparameters
                 if isinstance(best_params_json, str):
                     best_params = json.loads(best_params_json)
                 else:
                     best_params = best_params_json
 
-                # Only add if not already loaded from Experiments
                 if group_name not in hyperparams_by_group:
                     alg = result.get("ALGORITHM") or GROUP_MODEL.get(
                         group_name, _DEFAULT_MODEL
@@ -366,7 +319,7 @@ if not experiments_loaded or len(hyperparams_by_group) < len(expected_groups):
         print("   ⚠️  Table does not exist (this is OK if using ML Experiments)")
 
 # %% [markdown]
-# ### 2c. Defaults y validación de hiperparámetros
+# ### 2c. Defaults y validación
 
 # %%
 if len(hyperparams_by_group) == 0:
@@ -378,7 +331,6 @@ print(
     f"\n✅ Total loaded hyperparameters: {len(hyperparams_by_group)}/{len(expected_groups)} groups"
 )
 
-# Default hyperparameters por clase Snowflake ML (grupos sin resultados de búsqueda)
 DEFAULT_PARAMS_BY_MODEL = {
     "XGBRegressor": {
         "n_estimators": 100,
@@ -410,14 +362,8 @@ DEFAULT_PARAMS_BY_MODEL = {
     },
 }
 
-print(
-    f"\n📋 Default hyperparameters (per Snowflake ML model, for groups without search results):"
-)
-for model_name, params in DEFAULT_PARAMS_BY_MODEL.items():
-    print(f"   {model_name}: {list(params.keys())}")
-
-# Validate that we have hyperparameters for all expected groups
-print(f"\n🔍 Validating hyperparameter coverage...")
+print(f"\n📋 Defaults por modelo: {list(DEFAULT_PARAMS_BY_MODEL.keys())}")
+print(f"🔍 Validando cobertura...")
 groups_with_hyperparams = set(hyperparams_by_group.keys())
 groups_without_hyperparams = set(expected_groups) - groups_with_hyperparams
 
@@ -431,12 +377,10 @@ else:
     print(f"✅ All {len(expected_groups)} groups have optimized hyperparameters!")
 
 # %% [markdown]
-# ## 3. Preparar datos de entrenamiento (sin FeatureView)
+# ## 3. Datos de entrenamiento
 
 # %%
-print("\n" + "=" * 80)
-print("🏪 LOADING TRAINING DATA (SIN FEATURE VIEW)")
-print("=" * 80)
+print("\n🏪 Cargando datos de entrenamiento...")
 
 if USE_CLEANED_TABLES:
     print("📊 Loading from cleaned table: TRAIN_DATASET_CLEANED")
@@ -485,56 +429,47 @@ else:
         print(f"   Total records: {training_df.count():,}")
         print(f"   Columns: {len(training_df.columns)}")
 
-# Resolver nombre real de la columna de partición (Snowflake suele devolver MAYÚSCULAS)
-# DPFOrchestrator/MMT exige que el nombre de la columna coincida exactamente con partition_by.
 PARTITION_COL = next(
     (c for c in training_df.columns if c.upper() == "STATS_NTILE_GROUP"),
-    "stats_ntile_group",
+    "STATS_NTILE_GROUP",
 )
-# Normalizar a "stats_ntile_group" para evitar KeyError en el orquestador (pandas busca el nombre literal)
-if PARTITION_COL != "stats_ntile_group":
-    training_df = training_df.with_column_renamed(PARTITION_COL, "stats_ntile_group")
-    PARTITION_COL = "stats_ntile_group"
-    print(f"\n📌 Columna de partición renombrada a: '{PARTITION_COL}'")
-else:
-    print(f"\n📌 Columna de partición usada: '{PARTITION_COL}'")
-
-# Show distribution by group
-print("\n📊 Records per Group:")
+print(f"\n📌 Partición: '{PARTITION_COL}'")
+print("\n📊 Filas por grupo:")
 group_counts = (
     training_df.group_by(PARTITION_COL).count().sort(PARTITION_COL)
 )
 group_counts.show()
 
+if MMT_SAMPLE_FRACTION is not None and 0 < MMT_SAMPLE_FRACTION < 1:
+    n_before = training_df.count()
+    training_df = training_df.sample(frac=MMT_SAMPLE_FRACTION)
+    n_after = training_df.count()
+    print(f"\n⚠️  MMT en modo PRUEBA: usando {MMT_SAMPLE_FRACTION*100:.0f}% de la data ({n_after:,} de {n_before:,} filas)")
+
 # %% [markdown]
-# ## 4. Define Training Function for MMT
+# ## 4. Función de entrenamiento MMT
 
 # %%
-print("\n" + "=" * 80)
-print("🔧 DEFINING TRAINING FUNCTION")
-print("=" * 80)
-
-
 def _get_target_column(df):
-    """Return the target column name in df (case-insensitive match for uni_box_week)."""
     for c in df.columns:
         if str(c).upper() == "UNI_BOX_WEEK":
             return c
     return "uni_box_week"
 
 
+def _get_feature_cols_numeric(df, excluded_cols, target_col):
+    """Solo columnas numéricas (igual que script 03): Snowflake ML exige int/float/bool."""
+    excluded_upper = {str(x).upper() for x in list(excluded_cols) + [target_col]}
+    return [
+        col
+        for col in df.columns
+        if str(col).upper() not in excluded_upper
+        and getattr(df[col].dtype, "kind", "O") in "iufb"
+    ]
+
+
 def train_segment_model(data_connector, context):
-    """
-    Train regression model for uni_box_week for a specific group.
-    Model type per group: LGBMRegressor, XGBRegressor, or SGDRegressor (from script 03 / GROUP_MODEL).
-
-    Args:
-        data_connector: Snowflake data connector (provided by MMT)
-        context: Contains partition_id (stats_ntile_group name)
-
-    Returns:
-        Trained model (XGBRegressor, LGBMRegressor, or SGDRegressor)
-    """
+    import pandas as pd
     from snowflake.ml.modeling.xgboost import XGBRegressor
     from snowflake.ml.modeling.lightgbm import LGBMRegressor
     from snowflake.ml.modeling.linear_model import SGDRegressor
@@ -550,9 +485,8 @@ def train_segment_model(data_connector, context):
     df = data_connector.to_pandas()
     print(f"📊 Data shape: {df.shape}")
 
-    # Excluir columna de partición por nombre real (p. ej. STATS_NTILE_GROUP en Snowflake)
     partition_col_in_df = next(
-        (c for c in df.columns if c.upper() == "STATS_NTILE_GROUP"), "stats_ntile_group"
+        (c for c in df.columns if c.upper() == "STATS_NTILE_GROUP"), "STATS_NTILE_GROUP"
     )
     excluded_cols = [
         "customer_id",
@@ -562,11 +496,13 @@ def train_segment_model(data_connector, context):
         partition_col_in_df,
     ]
     target_col = _get_target_column(df)
-    feature_cols = [
-        col for col in df.columns if col not in excluded_cols + [target_col]
-    ]
-    X = df[feature_cols].fillna(0)
-    y = df[target_col].fillna(0)
+    feature_cols = _get_feature_cols_numeric(df, excluded_cols, target_col)
+    if len(feature_cols) < 5:
+        feature_cols = [c for c in df.columns if c not in excluded_cols + [target_col]]
+    X = df[feature_cols].copy()
+    for c in feature_cols:
+        X[c] = pd.to_numeric(X[c], errors="coerce").fillna(0)
+    y = pd.to_numeric(df[target_col], errors="coerce").fillna(0)
 
     print(f"   Features: {len(feature_cols)}")
     print(f"   Target range: [{y.min():.2f}, {y.max():.2f}]")
@@ -578,7 +514,15 @@ def train_segment_model(data_connector, context):
     print(f"   Training set: {X_train.shape[0]:,} samples")
     print(f"   Test set: {X_test.shape[0]:,} samples")
 
-    # Modelo para este grupo: nombre clase Snowflake ML (desde hyperparams o GROUP_MODEL)
+    # Snowflake ML exige int/float/bool (como script 03); asegurar float64
+    train_dataset = X_train.copy()
+    for c in feature_cols:
+        train_dataset[c] = np.asarray(train_dataset[c], dtype=np.float64)
+    train_dataset[target_col] = np.asarray(y_train, dtype=np.float64)
+    test_features = X_test.copy()
+    for c in feature_cols:
+        test_features[c] = np.asarray(test_features[c], dtype=np.float64)
+
     model_type = GROUP_MODEL.get(segment_name, _DEFAULT_MODEL)
     if segment_name in hyperparams_by_group:
         algorithm = hyperparams_by_group[segment_name].get("algorithm")
@@ -599,15 +543,38 @@ def train_segment_model(data_connector, context):
             f"\n   ⚠️  Using DEFAULT hyperparameters for {model_type} (no search results for {segment_name})"
         )
 
-    # Convert params to proper types
+    def _to_native(v):
+        """Como script 03: numpy -> Python nativo; string numérico -> float/int."""
+        if hasattr(v, "item"):
+            return v.item()
+        if isinstance(v, (int, float)):
+            return v
+        if isinstance(v, (np.integer, np.floating)):
+            return int(v) if isinstance(v, np.integer) else float(v)
+        if isinstance(v, str):
+            v = v.strip()
+            try:
+                f = float(v)
+                return int(f) if f == int(f) else f
+            except (ValueError, TypeError):
+                return v
+        return v
+
+    int_params = ("n_estimators", "max_depth", "num_leaves", "min_child_weight", "min_child_samples", "max_iter")
+    float_params = ("alpha", "learning_rate", "subsample", "colsample_bytree", "gamma", "reg_alpha", "reg_lambda", "tol", "eta0")
+    defaults = DEFAULT_PARAMS_BY_MODEL.get(model_type, DEFAULT_PARAMS_BY_MODEL["XGBRegressor"])
     model_params = {}
     for k, v in group_params.items():
-        if isinstance(v, (int, float)):
-            model_params[k] = v
-        elif isinstance(v, (np.integer, np.floating)):
-            model_params[k] = float(v) if isinstance(v, np.floating) else int(v)
-        else:
-            model_params[k] = v
+        vn = _to_native(v)
+        try:
+            if k in int_params:
+                model_params[k] = int(vn) if isinstance(vn, (int, float, np.integer, np.floating)) else defaults.get(k, vn)
+            elif k in float_params:
+                model_params[k] = float(vn) if isinstance(vn, (int, float, np.integer, np.floating)) else defaults.get(k, vn)
+            else:
+                model_params[k] = vn
+        except (TypeError, ValueError):
+            model_params[k] = defaults.get(k, vn)
     model_params["random_state"] = 42
 
     MODEL_CLASSES = {
@@ -628,10 +595,15 @@ def train_segment_model(data_connector, context):
         model_params.setdefault("learning_rate", "invscaling")
 
     print(f"\n   Training {model_type} with {len(model_params)} hyperparameters...")
-    model = ModelClass(**model_params)
-    model.fit(X_train, y_train)
+    model = ModelClass(
+        input_cols=feature_cols, label_cols=[target_col], **model_params
+    )
+    model.fit(train_dataset)
 
-    y_pred = model.predict(X_test)
+    pred_result = model.predict(test_features)
+    pred_df = pred_result.to_pandas() if hasattr(pred_result, "to_pandas") else pred_result
+    out_col = model.get_output_cols()[0]
+    y_pred = np.asarray(pred_df[out_col])
     rmse = np.sqrt(mean_squared_error(y_test, y_pred))
     mae = mean_absolute_error(y_test, y_pred)
 
@@ -652,90 +624,41 @@ def train_segment_model(data_connector, context):
     return model
 
 
-print("✅ Training function defined")
-
 # %% [markdown]
-# ## 5. Execute Many Model Training (MMT) - 16 Models
+# ## 5. Escalar cluster, Ray Dashboard, MMT
 
 # %%
-print("\n" + "=" * 80)
-print("📈 SCALING CLUSTER UP FOR MMT")
-print("=" * 80)
-
 try:
     from snowflake.ml.runtime_cluster import scale_cluster
-
-    print("⏳ Aumentando cluster a 4 contenedores...")
-    scale_cluster(
-        expected_cluster_size=4,
-        options={
-            "block_until_min_cluster_size": 2  # Retorna cuando al menos 2 nodos estén listos
-        }
-    )
-    print("✅ Cluster aumentado a 4 contenedores")
+    scale_cluster(expected_cluster_size=4, options={"block_until_min_cluster_size": 2})
+    print("✅ Cluster 4 nodos")
 except Exception as e:
-    print(f"⚠️  Error al escalar cluster: {str(e)[:200]}")
-    print("   Continuando con el cluster actual...")
+    print(f"⚠️ scale_cluster: {str(e)[:150]}")
 
-# %% [markdown]
-# ### 5b. (Opcional) Enlace al Ray Dashboard
-#
-# Copia la URL en tu navegador para monitorear el cluster durante el MMT.
-
-# %%
 try:
     from snowflake.ml.runtime_cluster import get_ray_dashboard_url
-
-    dashboard_url = get_ray_dashboard_url()
-    print(f"✅ Ray Dashboard: {dashboard_url}")
+    print(f"✅ Ray Dashboard: {get_ray_dashboard_url()}")
 except Exception as e:
-    print("⚠️ No se pudo obtener la URL del Ray Dashboard.")
-    print(f"   Detalle: {str(e)[:200]}")
-
-# %% [markdown]
-# ### 5c. Ejecutar MMT y monitorear
+    print(f"⚠️ Ray Dashboard: {str(e)[:100]}")
 
 # %%
-print("\n" + "=" * 80)
-print("🚀 STARTING MANY MODEL TRAINING (MMT) - 16 MODELS")
-print("=" * 80)
-print(
-    "\nTraining 16 models in PARALLEL (LGBMRegressor, XGBRegressor, SGDRegressor per group)"
-)
-print("Each model uses group-specific hyperparameters\n")
-
 start_time = time.time()
-
-# Create MMT trainer
 trainer = ManyModelTraining(train_segment_model, "BD_AA_DEV.SC_MODELS_BMX.MMT_MODELS")
-
-# Execute training with partition_by stats_ntile_group
 training_run = trainer.run(
-    partition_by="stats_ntile_group",  # ← KEY: Partition by group
+    partition_by=PARTITION_COL,
     snowpark_dataframe=training_df,
     run_id=f"uni_box_regression_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
 )
 
-print(f"\n✅ Training started. Run ID: {training_run.run_id}")
-print("   Monitorea en Ray Dashboard (celda 5b) o ejecuta la celda 5d cuando quieras esperar.")
-print("   Para no bloquear: ejecuta solo hasta aquí y más tarde vuelve a ejecutar la celda 5d.\n")
+print(f"\n✅ Run ID: {training_run.run_id}\n")
 
 # %% [markdown]
-# ### 5d. (Opcional) Esperar a que termine el MMT
-#
-# **No hace falta esperar aquí.** Puedes cerrar/continuar y volver más tarde.
-# - Monitorea en **Ray Dashboard** (celda 5b).
-# - Cuando quieras bloquear hasta que termine: ejecuta esta celda.
-# - Si pones `MMT_MAX_WAIT = 7200` (2 h) y ejecutas esta celda, esperará hasta 2 h o hasta que termine.
-# - Si se cumple el timeout sin terminar, vuelve a ejecutar esta celda (con mismo o mayor `MMT_MAX_WAIT`).
+# ### 5d. Esperar MMT (opcional; si falla partition_details se sale del bucle)
 
 # %%
 import time as time_module
-
-# Ajusta según quieras: tiempo máximo que esta celda esperará (segundos)
-# 600 = 10 min (solo para ver algo de progreso); 7200 = 2 h (esperar hasta el final)
 MMT_MAX_WAIT = 600
-MMT_CHECK_INTERVAL = 30  # Log cada 30 s (no cada 10 s)
+MMT_CHECK_INTERVAL = 30
 
 elapsed = 0
 completed = False
@@ -746,34 +669,28 @@ while elapsed < MMT_MAX_WAIT:
     elapsed += MMT_CHECK_INTERVAL
 
     try:
-        done_count = 0
-        total_count = 0
-        for partition_id in training_run.partition_details:
-            total_count += 1
-            status = training_run.partition_details[partition_id].status
-            if status.name == "DONE" or status.name == "FAILED":
-                done_count += 1
+        details = training_run.partition_details
+    except Exception as e:
+        print(f"\n⚠️  partition_details falló: {str(e)[:180]}")
+        print("   Deja de esperar. Revisa Ray Dashboard o ejecuta 6/7 más tarde.")
+        break
 
-        print(
-            f"⏱️  {elapsed}s - Progress: {done_count}/{total_count} models completed",
-            end="\r",
-        )
+    total_count = len(details)
+    done_count = sum(1 for pid in details if details[pid].status.name == "DONE")
+    failed_count = sum(1 for pid in details if details[pid].status.name == "FAILED")
+    pending_count = total_count - done_count - failed_count
+    print(
+        f"⏱️  {elapsed}s - OK: {done_count} | FAILED: {failed_count} | pending: {pending_count}",
+        end="\r",
+    )
 
-        if done_count == total_count:
-            print("\n✅ All models completed!" + " " * 50)
-            completed = True
-            break
-    except Exception:
-        print(f"⏱️  {elapsed}s - Waiting for status update...", end="\r")
+    if done_count + failed_count == total_count:
+        print("\n✅ All models completed!" + " " * 30)
+        completed = True
+        break
 
 if not completed:
-    print("\n" + "=" * 80)
-    print("⏱️  Timeout de espera alcanzado (training puede seguir en segundo plano).")
-    print("   → Revisa el Ray Dashboard (celda 5b) para ver progreso.")
-    print("   → Para esperar hasta el final: pon MMT_MAX_WAIT = 7200 (o más) y vuelve a ejecutar esta celda.")
-    print("   → Cuando todo haya terminado, ejecuta las celdas 6 y 7 (resultados y registro).")
-    print("=" * 80)
-    # Verificación rápida por stage
+    print("\n⏱️  Timeout. Training puede seguir en background; revisa Ray Dashboard o ejecuta 6/7 más tarde.")
     try:
         stage_files = session.sql(
             f"LIST @BD_AA_DEV.SC_MODELS_BMX.MMT_MODELS PATTERN='.*{training_run.run_id}.*'"
@@ -784,61 +701,76 @@ if not completed:
     except Exception:
         pass
 else:
-    print("\n" + "=" * 80)
-    print("✅ TRAINING COMPLETE!")
-    print("=" * 80)
-
+    print("\n✅ TRAINING COMPLETE")
 end_time = time.time()
-elapsed_minutes = (end_time - run_start) / 60
-print(f"\n⏱️  Tiempo en esta celda: {elapsed_minutes:.2f} min")
+print(f"\n⏱️  {((end_time - run_start) / 60):.2f} min")
+
+try:
+    from snowflake.ml.runtime_cluster import scale_cluster
+    scale_cluster(expected_cluster_size=1)
+    print("✅ Cluster scale down a 1 nodo")
+except Exception as e:
+    print(f"⚠️ scale down: {str(e)[:120]}")
 
 # %% [markdown]
-# ## 6. Review Training Results
+# ## 6. Resultados por partición
 
 # %%
-print("\n📊 Training Results:\n")
+try:
+    partition_details = training_run.partition_details
+except Exception as e:
+    partition_details = {}
+    print(f"⚠️ partition_details falló: {str(e)[:200]}. Re-ejecuta desde §3, luego 5c→5d→6.")
 
-for partition_id in training_run.partition_details:
-    details = training_run.partition_details[partition_id]
-
-    if details.status.name == "DONE":
+done_ids = []
+failed_ids = []
+pending_ids = []
+for partition_id in partition_details:
+    details = partition_details[partition_id]
+    st = details.status.name
+    if st == "DONE":
+        done_ids.append(partition_id)
         try:
             model = training_run.get_model(partition_id)
-
-            print(f"\n✅ {partition_id if partition_id else 'DEFAULT'}:")
-            print(f"   RMSE: {model.rmse:.2f}")
-            print(f"   MAE: {model.mae:.2f}")
-            print(f"   Training samples: {model.training_samples:,}")
-            print(f"   Test samples: {model.test_samples:,}")
+            print(f"\n✅ {partition_id}: RMSE={model.rmse:.2f}, MAE={model.mae:.2f}, samples={model.training_samples:,}")
         except Exception as e:
-            print(f"\n⚠️  {partition_id}: Could not load model - {str(e)[:100]}")
+            print(f"\n⚠️  {partition_id}: DONE pero no se pudo cargar - {str(e)[:100]}")
+    elif st == "FAILED":
+        failed_ids.append(partition_id)
+        print(f"\n❌ {partition_id}: FAILED")
+        try:
+            logs = getattr(details, "logs", None)
+            if logs and "Error:" in logs:
+                err_line = next((l for l in logs.split("\n") if "Error:" in l), None)
+                if err_line:
+                    print(f"   {err_line.strip()[:200]}")
+        except Exception:
+            pass
     else:
-        print(f"\n❌ {partition_id}: Training failed")
-        print(f"   Status: {details.status}")
+        pending_ids.append(partition_id)
+        print(f"\n⏳ {partition_id}: {st}")
+print(f"\n--- Resumen: {len(done_ids)} OK, {len(failed_ids)} FAILED, {len(pending_ids)} pendientes ---")
 
 # %% [markdown]
-# ## 7. Register Model in Model Registry
+# ## 7. Registrar modelos en Registry
 
 # %%
-print("\n" + "=" * 80)
-print("📝 REGISTERING MODEL IN MODEL REGISTRY")
-print("=" * 80)
-
 version_date = datetime.now().strftime("%Y%m%d_%H%M")
 registered_models = {}
+try:
+    _reg_partitions = training_run.partition_details
+except Exception as e:
+    _reg_partitions = {}
+    print(f"⚠️ partition_details: {str(e)[:180]}")
 
-# %% Registrar cada modelo por grupo
-for partition_id in training_run.partition_details:
-    details = training_run.partition_details[partition_id]
+for partition_id in _reg_partitions:
+    details = _reg_partitions[partition_id]
 
     if details.status.name == "DONE":
         try:
             model = training_run.get_model(partition_id)
 
-            # Model name includes group identifier
             model_name = f"uni_box_regression_{partition_id.lower()}"
-
-            # Get group-specific search ID, algorithm, and hyperparameters if available
             group_search_id = None
             group_hyperparams = None
             group_algorithm = GROUP_MODEL.get(partition_id, _DEFAULT_MODEL)
@@ -849,16 +781,7 @@ for partition_id in training_run.partition_details:
                 if alg:
                     group_algorithm = alg
 
-            # Prepare sample input from this group
-            sample_input = (
-                training_df.filter(training_df[PARTITION_COL] == partition_id)
-                .select(model.feature_cols)
-                .limit(5)
-            )
-
-            print(f"\nRegistering {partition_id}...")
-
-            # Prepare metrics including hyperparameters
+            print(f"\nRegistrando {partition_id}...")
             model_metrics = {
                 "rmse": float(model.rmse),
                 "mae": float(model.mae),
@@ -869,9 +792,7 @@ for partition_id in training_run.partition_details:
                 "hyperparameter_search_id": group_search_id or "default",
             }
 
-            # Add hyperparameters to metrics (as nested dict)
             if group_hyperparams:
-                # Convert hyperparameters to a format suitable for metrics
                 for key, value in group_hyperparams.items():
                     if isinstance(value, (int, float)):
                         model_metrics[f"hyperparameter_{key}"] = (
@@ -890,7 +811,6 @@ for partition_id in training_run.partition_details:
                 version_name=f"v_{version_date}",
                 comment=f"{group_algorithm} regression model for uni_box_week - Group: {partition_id}",
                 metrics=model_metrics,
-                sample_input_data=sample_input,
                 task=task.Task.TABULAR_REGRESSION,
             )
 
@@ -909,10 +829,9 @@ for partition_id in training_run.partition_details:
 print(f"\n✅ {len(registered_models)} model(s) registered successfully!")
 
 # %% [markdown]
-# ## 8. Set Production Alias
+# ## 8. Alias PRODUCTION
 
 # %%
-print("\n🏷️  Setting PRODUCTION aliases...\n")
 
 for partition_id, model_info in registered_models.items():
     model_name = model_info["model_name"]
@@ -920,71 +839,27 @@ for partition_id, model_info in registered_models.items():
     model_version = model_info["model_version"]
 
     try:
-        # Remove existing PRODUCTION alias
         try:
-            model_ref = registry.get_model(model_name)
-            model_ref.default.unset_alias("PRODUCTION")
-        except:
+            registry.get_model(model_name).default.unset_alias("PRODUCTION")
+        except Exception:
             pass
-
-        # Set alias on new version
         model_version.set_alias("PRODUCTION")
         print(f"✅ {model_name}: PRODUCTION → {version}")
     except Exception as e:
         print(f"⚠️  {model_name}: Error setting alias - {str(e)[:100]}")
 
-print("\n✅ All production aliases configured!")
-
 # %% [markdown]
-# ## 8b. Scale cluster down
+# ## 9. Resumen
 
 # %%
-print("\n" + "=" * 80)
-print("📉 SCALING CLUSTER DOWN")
-print("=" * 80)
-
-try:
-    from snowflake.ml.runtime_cluster import scale_cluster
-
-    print("⏳ Reduciendo cluster a 1 contenedor...")
-    scale_cluster(
-        expected_cluster_size=1
-    )
-    print("✅ Cluster reducido a 1 contenedor")
-except Exception as e:
-    print(f"⚠️  Error al reducir cluster: {str(e)[:200]}")
-    print("   El cluster puede seguir escalado...")
-
-# %% [markdown]
-# ## 9. Summary
-
-# %%
-print("\n" + "=" * 80)
-print("🎉 MANY MODEL TRAINING (MMT) COMPLETE!")
-print("=" * 80)
-
-print("\n📊 Summary:")
-print(f"   ✅ Models trained: {len(registered_models)}/16")
-print(f"   ⏱️  Training time: {elapsed_minutes:.2f} minutes")
-print(f"   🔧 Algorithms: LGBM / XGB / SGD (per group)")
-print(f"   📈 Hyperparameters: Group-specific (from hyperparameter search)")
-
+_elapsed = (time.time() - start_time) / 60
+print(f"\n✅ MMT: {len(registered_models)}/16 modelos | {_elapsed:.2f} min")
 if registered_models:
-    print(f"\n🏆 Model Performance by Group:")
-    for partition_id in sorted(registered_models.keys()):
-        model = training_run.get_model(partition_id)
-        print(
-            f"   {partition_id}: RMSE={model.rmse:.2f}, MAE={model.mae:.2f}, Samples={model.training_samples:,}"
-        )
-
-print("\n💡 Next Steps:")
-print("   1. Review model performance by group")
-print(
-    "   2. Run 05_create_partitioned_model.py to create partitioned model (combines all 16)"
-)
-print(
-    "   3. Run 06_partitioned_inference_batch.py for batch inference with automatic routing"
-)
-
-print("\n" + "=" * 80)
+    for pid in sorted(registered_models.keys()):
+        try:
+            m = training_run.get_model(pid)
+            print(f"   {pid}: RMSE={m.rmse:.2f}, MAE={m.mae:.2f}")
+        except Exception:
+            pass
+print("   Siguiente: 05_create_partitioned_model.py → 06_partitioned_inference_batch.py")
 
