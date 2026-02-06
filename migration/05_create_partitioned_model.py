@@ -136,20 +136,65 @@ partitioned_model = PartitionedUniBoxModel(model_context=model_context)
 print("✅ Partitioned model created")
 
 # %% [markdown]
-# ## 4. Sample input (opcional, para inspección)
+# ## 4. Sample input (misma lógica de exclusión que 02/04/06 para homologar firma de PREDICT)
 
 # %%
+print("\n" + "=" * 80)
+print("📋 PREPARING SAMPLE INPUT (HOMOLOGADO CON 06)")
+print("=" * 80)
+
+# Usar la misma lista de exclusión que 02/04/06 para asegurar que sample_input tenga la misma firma que inferencia
+excluded_cols_sample = [
+    "customer_id",
+    "brand_pres_ret",
+    "week",
+    "group",
+    "stats_group",
+    "percentile_group",
+    "stats_ntile_group",
+    "uni_box_week",  # Target - no es feature
+    "FEATURE_TIMESTAMP",
+]
+excluded_upper_sample = {c.upper() for c in excluded_cols_sample}
+
+# Obtener esquema de training para identificar features numéricas (igual que 06 con inference)
+training_schema = session.sql(
+    "DESCRIBE TABLE BD_AA_DEV.SC_STORAGE_BMX_PS.TRAIN_DATASET_CLEANED"
+).collect()
+col_type_dict_sample = {row["name"].upper(): str(row["type"]).upper() for row in training_schema}
+all_cols_sample = [row["name"] for row in training_schema]
+
+NUMERIC_PREFIXES_SAMPLE = ("FLOAT", "NUMBER", "INTEGER", "BIGINT", "DOUBLE")
+feature_cols_sample = [
+    c for c in all_cols_sample
+    if c.upper() not in excluded_upper_sample
+    and (col_type_dict_sample.get(c.upper()) or "").startswith(NUMERIC_PREFIXES_SAMPLE)
+]
+
+# Verificar que feature_cols_sample coincida con feature_cols de los modelos (deberían ser iguales)
+if set(c.upper() for c in feature_cols_sample) != set(c.upper() for c in feature_cols):
+    print(f"⚠️  Feature mismatch: sample tiene {len(feature_cols_sample)}, modelos tienen {len(feature_cols)}")
+    print(f"   Usando feature_cols de modelos para mantener compatibilidad")
+    feature_cols_for_sample = feature_cols
+else:
+    # Ordenar feature_cols_sample según el orden de feature_cols para mantener consistencia
+    feature_cols_for_sample = [c for c in feature_cols if c.upper() in {x.upper() for x in feature_cols_sample}]
+    if len(feature_cols_for_sample) != len(feature_cols):
+        print(f"⚠️  Algunas features de modelos no están en sample, usando todas las de modelos")
+        feature_cols_for_sample = feature_cols
+
 training_df = session.table("BD_AA_DEV.SC_STORAGE_BMX_PS.TRAIN_DATASET_CLEANED")
 sample_input_sp = (
-    training_df.select("customer_id", "stats_ntile_group", *feature_cols)
+    training_df.select("customer_id", "stats_ntile_group", *feature_cols_for_sample)
     .filter(training_df["stats_ntile_group"].isin(list(loaded_models.keys())))
     .group_by("stats_ntile_group")
-    .agg(*[F.min(F.col(c)).alias(c) for c in ["customer_id"] + feature_cols])
-    .select("customer_id", "stats_ntile_group", *feature_cols)
+    .agg(*[F.min(F.col(c)).alias(c) for c in ["customer_id"] + feature_cols_for_sample])
+    .select("customer_id", "stats_ntile_group", *feature_cols_for_sample)
     .limit(min(16, len(loaded_models)))
 )
 sample_input = sample_input_sp.to_pandas()
 print(f"✅ Sample input prepared: {len(sample_input)} rows (one per group)")
+print(f"   Columns: customer_id, stats_ntile_group, {len(feature_cols_for_sample)} features")
 
 # %% [markdown]
 # ## 5. Register Partitioned Model

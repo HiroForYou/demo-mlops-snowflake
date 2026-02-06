@@ -63,42 +63,88 @@ print(f"✅ Loaded {n_records:,} records from INFERENCE_DATASET_CLEANED (sin Fea
 inference_df.select("customer_id", "week", "brand_pres_ret", partition_col, "sum_past_12_weeks", "week_of_year").show(5)
 
 # %% [markdown]
-# ## 3. Prepare inference input (misma lógica que 02/04: excluir metadata, solo numéricas)
+# ## 3. Prepare inference input (misma exclusión que 02/04: solo features numéricas, sin metadata)
 
 # %%
 print("\n" + "="*80)
 print("🔧 PREPARING INFERENCE INPUT")
 print("="*80)
 
-# Misma exclusión que script 04 (train_segment_model): no son features
+# Misma lista de exclusión que script 02 (Feature Store) y 04: no son features para el modelo
 excluded_cols = [
-    "customer_id", "brand_pres_ret", "week",
+    "customer_id",
+    "brand_pres_ret",
+    "week",
+    "group",
+    "stats_group",
+    "percentile_group",
+    "stats_ntile_group",
     "FEATURE_TIMESTAMP",
-    partition_col,
 ]
 excluded_upper = {c.upper() for c in excluded_cols}
 
-inference_df.write.mode('overwrite').save_as_table('BD_AA_DEV.SC_STORAGE_BMX_PS.INFERENCE_INPUT_TEMP')
+# Obtener esquema de la tabla de inferencia para identificar solo columnas de features (numéricas, no excluidas)
+inference_schema = session.sql(
+    "DESCRIBE TABLE BD_AA_DEV.SC_STORAGE_BMX_PS.INFERENCE_DATASET_CLEANED"
+).collect()
+col_type_dict = {row["name"].upper(): str(row["type"]).upper() for row in inference_schema}
+all_cols = [row["name"] for row in inference_schema]
 
-temp_table = session.table('BD_AA_DEV.SC_STORAGE_BMX_PS.INFERENCE_INPUT_TEMP')
-actual_cols = temp_table.columns
-temp_schema = session.sql("DESCRIBE TABLE BD_AA_DEV.SC_STORAGE_BMX_PS.INFERENCE_INPUT_TEMP").collect()
-col_type_dict = {row['name'].upper(): str(row['type']).upper() for row in temp_schema}
-
-# Solo columnas numéricas y no excluidas, en el orden de la tabla (igual que 04 con dtype.kind in 'iufb')
 NUMERIC_PREFIXES = ("FLOAT", "NUMBER", "INTEGER", "BIGINT", "DOUBLE")
 feature_cols_actual = [
-    c for c in actual_cols
+    c for c in all_cols
     if c.upper() not in excluded_upper
     and (col_type_dict.get(c.upper()) or "").startswith(NUMERIC_PREFIXES)
 ]
 
+# Crear INFERENCE_INPUT_TEMP solo con columnas necesarias: claves + partition + features (lo que espera PREDICT)
+# Excluir group, stats_group, percentile_group y cualquier no-feature (VARCHAR como PROD_KEY) para que PREDICT reciba la firma correcta
+keys_and_partition_upper = {"CUSTOMER_ID", "BRAND_PRES_RET", "WEEK", partition_col.upper()}
+feature_names_upper = {c.upper() for c in feature_cols_actual}
+# Solo incluir columnas que sean: (1) claves/partición, o (2) features numéricas (verificar tipo también)
+cols_to_keep = []
+for c in inference_df.columns:
+    c_upper = c.upper()
+    if c_upper in keys_and_partition_upper:
+        cols_to_keep.append(c)
+    elif c_upper in feature_names_upper:
+        # Verificar que realmente sea numérica (doble verificación)
+        col_type = col_type_dict.get(c_upper, "")
+        if col_type.startswith(NUMERIC_PREFIXES):
+            cols_to_keep.append(c)
+
+inference_input_df = inference_df.select(cols_to_keep)
+inference_input_df.write.mode("overwrite").save_as_table("BD_AA_DEV.SC_STORAGE_BMX_PS.INFERENCE_INPUT_TEMP")
+
+temp_table = session.table("BD_AA_DEV.SC_STORAGE_BMX_PS.INFERENCE_INPUT_TEMP")
+actual_cols = temp_table.columns
 customer_id_col = next((c for c in actual_cols if c.upper() == "CUSTOMER_ID"), "CUSTOMER_ID")
 brand_col = next((c for c in actual_cols if c.upper() == "BRAND_PRES_RET"), "BRAND_PRES_RET")
 week_col = next((c for c in actual_cols if c.upper() == "WEEK"), "WEEK")
 partition_col_actual = next((c for c in actual_cols if c.upper() == partition_col.upper()), partition_col)
 
-print(f"✅ {len(feature_cols_actual)} features, partition: {partition_col_actual}")
+# Recalcular feature_cols_actual desde la temp table (asegurar que solo tenga numéricas, sin VARCHAR como PROD_KEY)
+temp_schema = session.sql("DESCRIBE TABLE BD_AA_DEV.SC_STORAGE_BMX_PS.INFERENCE_INPUT_TEMP").collect()
+temp_col_type_dict = {row["name"].upper(): str(row["type"]).upper() for row in temp_schema}
+feature_cols_actual = [
+    c for c in actual_cols
+    if c.upper() not in excluded_upper
+    and (temp_col_type_dict.get(c.upper()) or "").startswith(NUMERIC_PREFIXES)
+]
+
+# Verificar que no haya VARCHARs en features (debug)
+non_numeric_in_features = [
+    c for c in feature_cols_actual
+    if not (temp_col_type_dict.get(c.upper()) or "").startswith(NUMERIC_PREFIXES)
+]
+if non_numeric_in_features:
+    print(f"⚠️  ADVERTENCIA: Columnas no numéricas en features: {non_numeric_in_features}")
+    feature_cols_actual = [c for c in feature_cols_actual if c not in non_numeric_in_features]
+
+print(f"✅ Excluidas (no features): {list(excluded_cols)}")
+print(f"✅ {len(feature_cols_actual)} features numéricas para PREDICT, partition: {partition_col_actual}")
+if len(feature_cols_actual) > 0:
+    print(f"   Primeras 5 features: {feature_cols_actual[:5]}")
 
 # %% [markdown]
 # ## 4. Execute partitioned inference
