@@ -4,7 +4,7 @@
 
 # %%
 from snowflake.snowpark.context import get_active_session
-from snowflake.snowpark.functions import col, first, lit
+from snowflake.snowpark import functions as F
 from snowflake.ml.registry import Registry
 from snowflake.ml.model import custom_model, task
 import pandas as pd
@@ -73,7 +73,8 @@ class PartitionedUniBoxModel(custom_model.CustomModel):
 
     def __init__(self, model_context):
         super().__init__(model_context)
-        self.feature_cols = None
+        # Usamos las mismas columnas de features detectadas al cargar los modelos base
+        self.feature_cols = feature_cols
 
     @custom_model.partitioned_api
     def predict(self, input_df: pd.DataFrame) -> pd.DataFrame:
@@ -84,7 +85,7 @@ class PartitionedUniBoxModel(custom_model.CustomModel):
         part_col = "stats_ntile_group" if "stats_ntile_group" in input_df.columns else "STATS_NTILE_GROUP"
         group_name = input_df[part_col].iloc[0]
 
-        model_key = f"group_{group_name.lower()}"
+        model_key = group_name.lower()
         try:
             model = self.context.model_ref(model_key)
         except Exception:
@@ -93,12 +94,7 @@ class PartitionedUniBoxModel(custom_model.CustomModel):
             except Exception:
                 raise ValueError(f"Model not found for group: {group_name}. Keys: {list(self.context.models.keys())}")
 
-        if self.feature_cols is None:
-            self.feature_cols = getattr(model, "feature_cols", None)
-            if not self.feature_cols:
-                meta = {"customer_id", "brand_pres_ret", "week", "group", "stats_group", "percentile_group", "stats_ntile_group", "STATS_NTILE_GROUP", "FEATURE_TIMESTAMP"}
-                self.feature_cols = [c for c in input_df.columns if c not in meta]
-
+        # Seleccionamos únicamente las columnas de features ya conocidas
         X = input_df[self.feature_cols].fillna(0).astype(np.float64, errors="ignore")
         pred_out = model.predict(X)
 
@@ -130,7 +126,7 @@ print("=" * 80)
 
 models_dict = {}
 for group_name, model_info in loaded_models.items():
-    model_key = f"group_{group_name.lower()}"
+    model_key = group_name.lower()
     models_dict[model_key] = model_info["model"]
     print(f"   Added {group_name} → {model_key}")
 print(f"\n✅ ModelContext created with {len(models_dict)} models")
@@ -144,15 +140,16 @@ print("✅ Partitioned model created")
 
 # %%
 training_df = session.table("BD_AA_DEV.SC_STORAGE_BMX_PS.TRAIN_DATASET_CLEANED")
-sample_input = (
+sample_input_sp = (
     training_df.select("customer_id", "stats_ntile_group", *feature_cols)
     .filter(training_df["stats_ntile_group"].isin(list(loaded_models.keys())))
     .group_by("stats_ntile_group")
-    .agg(*[first(col(c)).alias(c) for c in ["customer_id"] + feature_cols])
+    .agg(*[F.min(F.col(c)).alias(c) for c in ["customer_id"] + feature_cols])
     .select("customer_id", "stats_ntile_group", *feature_cols)
     .limit(min(16, len(loaded_models)))
 )
-print(f"✅ Sample input prepared: {sample_input.count()} rows (one per group)")
+sample_input = sample_input_sp.to_pandas()
+print(f"✅ Sample input prepared: {len(sample_input)} rows (one per group)")
 
 # %% [markdown]
 # ## 5. Register Partitioned Model
@@ -180,6 +177,7 @@ try:
             "model_type": "mixed",
             "groups": ",".join(sorted(loaded_models.keys())),
         },
+        sample_input_data=sample_input,
         task=task.Task.TABULAR_REGRESSION,
         options={"function_type": "TABLE_FUNCTION"},
     )
@@ -223,91 +221,7 @@ else:
     print("❌ Model not found in registry")
 
 # %% [markdown]
-# ## 7. Test Partitioned Inference (Quick Test)
-
-# %%
-print("\n" + "=" * 80)
-print("🧪 TESTING PARTITIONED INFERENCE")
-print("=" * 80)
-
-test_data = (
-    training_df.select("customer_id", *feature_cols)
-    .limit(10)
-    .with_column("dummy_partition", lit("ALL"))
-)
-
-test_data.write.mode("overwrite").save_as_table(
-    "BD_AA_DEV.SC_STORAGE_BMX_PS.TEST_INFERENCE_TEMP"
-)
-
-print("\n📊 Test data prepared: 10 samples")
-
-test_sql = """
-WITH test_predictions AS (
-    SELECT 
-        p.customer_id,
-        p.predicted_uni_box_week
-    FROM BD_AA_DEV.SC_STORAGE_BMX_PS.TEST_INFERENCE_TEMP t,
-        TABLE(
-            BD_AA_DEV.SC_MODELS_BMX.UNI_BOX_REGRESSION_PARTITIONED!PREDICT(
-                t.customer_id,
-                t.sum_past_12_weeks,
-                t.avg_past_12_weeks,
-                t.max_past_24_weeks,
-                t.sum_past_24_weeks,
-                t.week_of_year,
-                t.avg_avg_daily_all_hours,
-                t.sum_p4w,
-                t.avg_past_24_weeks,
-                t.pharm_super_conv,
-                t.wines_liquor,
-                t.groceries,
-                t.max_prev2,
-                t.avg_prev2,
-                t.max_prev3,
-                t.avg_prev3,
-                t.w_m1_total,
-                t.w_m2_total,
-                t.w_m3_total,
-                t.w_m4_total,
-                t.spec_foods,
-                t.prod_key,
-                t.num_coolers,
-                t.num_doors,
-                t.max_past_4_weeks,
-                t.sum_past_4_weeks,
-                t.avg_past_4_weeks,
-                t.max_past_12_weeks
-            ) OVER (PARTITION BY t.dummy_partition)
-        ) p
-)
-SELECT 
-    customer_id,
-    ROUND(predicted_uni_box_week, 2) AS predicted_uni_box_week
-FROM test_predictions
-ORDER BY customer_id
-LIMIT 5
-"""
-
-try:
-    test_results = session.sql(test_sql)
-    print("\n✅ Partitioned inference test successful!")
-    print("\n📊 Sample predictions:")
-    test_results.show()
-except Exception as e:
-    print(
-        f"\n⚠️  Test inference error (this is OK if feature order differs): {str(e)[:200]}"
-    )
-    print(
-        "   The model is registered correctly, feature order will be handled in inference script"
-    )
-
-session.sql(
-    "DROP TABLE IF EXISTS BD_AA_DEV.SC_STORAGE_BMX_PS.TEST_INFERENCE_TEMP"
-).collect()
-
-# %% [markdown]
-# ## 8. Summary
+# ## 7. Summary
 
 # %%
 print("\n" + "=" * 80)

@@ -1,27 +1,13 @@
 # %% [markdown]
-# # Migration: Partitioned Inference Batch
-# 
-# ## Overview
-# This script executes batch inference using the partitioned model with partitioned inference syntax.
-# 
-# ## What We'll Do:
-# 1. Load inference data from cleaned table
-# 2. Prepare features for inference
-# 3. Execute partitioned inference using TABLE(...) OVER (PARTITION BY ...) syntax
-# 4. Save predictions to inference logs
-# 5. Generate statistics
+# # Partitioned Inference Batch
+# Load inference data, run TABLE(model!PREDICT(...) OVER (PARTITION BY stats_ntile_group)), save to INFERENCE_LOGS.
 
 # %%
 from snowflake.snowpark.context import get_active_session
 from snowflake.ml.registry import Registry
-from snowflake.ml.feature_store import FeatureStore
-from snowflake.snowpark import functions as F
-import pandas as pd
 import time
 
 session = get_active_session()
-
-# Set context
 session.sql("USE DATABASE BD_AA_DEV").collect()
 session.sql("USE SCHEMA SC_STORAGE_BMX_PS").collect()
 
@@ -31,12 +17,16 @@ registry = Registry(
     schema_name="SC_MODELS_BMX"
 )
 
+INFERENCE_SAMPLE_FRACTION = 0.01
+
 print("✅ Connected to Snowflake")
 print(f"   Database: {session.get_current_database()}")
 print(f"   Schema: {session.get_current_schema()}")
+if INFERENCE_SAMPLE_FRACTION:
+    print(f"   ⚠️  Sampling: {INFERENCE_SAMPLE_FRACTION*100:.1f}% del dataset de inferencia")
 
 # %% [markdown]
-# ## 1. Verify Partitioned Model
+# ## 1. Verify model
 
 # %%
 print("\n" + "="*80)
@@ -45,193 +35,123 @@ print("="*80)
 
 model_ref = registry.get_model("UNI_BOX_REGRESSION_PARTITIONED")
 model_version = model_ref.version("PRODUCTION")
-
-print("✅ Model: UNI_BOX_REGRESSION_PARTITIONED")
-print(f"   Version: {model_version.version_name}")
-print(f"   Alias: PRODUCTION")
-
-# Show model functions
-functions = session.sql("""
-    SHOW FUNCTIONS IN MODEL BD_AA_DEV.SC_MODELS_BMX.UNI_BOX_REGRESSION_PARTITIONED
-""").collect()
-
-print(f"\n📋 Available functions:")
-for f in functions:
-    print(f"   - {f['name']}")
+print(f"✅ UNI_BOX_REGRESSION_PARTITIONED @ {model_version.version_name} (PRODUCTION)")
 
 # %% [markdown]
-# ## 2. Load Inference Data from Feature Store
+# ## 2. Load inference data (directamente desde INFERENCE_DATASET_CLEANED)
+# No se usa Feature Store: inferencia consume la tabla cleaned con las mismas columnas que validó 01 (compatibles con training).
 
 # %%
 print("\n" + "="*80)
-print("🏪 LOADING FEATURES FROM FEATURE STORE")
+print("📋 LOADING INFERENCE DATA (INFERENCE_DATASET_CLEANED)")
 print("="*80)
 
-# Initialize Feature Store
-fs = FeatureStore(
-    session=session,
-    database="BD_AA_DEV",
-    name="SC_FEATURES_BMX",
-    default_warehouse="WH_AA_DEV_DS_SQL",
-)
+inference_df = session.table("BD_AA_DEV.SC_STORAGE_BMX_PS.INFERENCE_DATASET_CLEANED")
 
-print("✅ Feature Store initialized")
+partition_col = next((c for c in inference_df.columns if c.upper() == "STATS_NTILE_GROUP"), None)
+if partition_col is None:
+    raise ValueError("stats_ntile_group not found in inference dataset.")
 
-# Get FeatureView
-try:
-    feature_view = fs.get_feature_view("UNI_BOX_FEATURES", version="v1")
-    print("✅ FeatureView 'UNI_BOX_FEATURES' v1 loaded")
-except Exception as e:
-    # Try v2 if v1 doesn't exist
-    try:
-        feature_view = fs.get_feature_view("UNI_BOX_FEATURES", version="v2")
-        print("✅ FeatureView 'UNI_BOX_FEATURES' v2 loaded")
-    except:
-        print(f"❌ Error loading FeatureView: {str(e)}")
-        print("   Please run 02_feature_store_setup.py first")
-        raise
+if INFERENCE_SAMPLE_FRACTION and 0 < INFERENCE_SAMPLE_FRACTION < 1:
+    inference_df = inference_df.sample(frac=INFERENCE_SAMPLE_FRACTION)
 
-# Get inference entity keys (customer_id, brand_pres_ret, week) and stats_ntile_group from inference table
-# This will be our "spine" - the entities we want features for
-print("\n⏳ Loading inference entity keys (spine) with stats_ntile_group...")
-inference_spine = session.table("BD_AA_DEV.SC_STORAGE_BMX_PS.INFERENCE_DATASET_CLEANED").select(
-    "customer_id", "brand_pres_ret", "week", "stats_ntile_group"
-).distinct()
+n_records = inference_df.count()
+print(f"   Inference records: {n_records:,}")
+inference_df.group_by(partition_col).count().sort(partition_col).show()
 
-print(f"   Unique inference keys: {inference_spine.count():,}")
-
-# Verify stats_ntile_group exists
-if "stats_ntile_group" not in inference_spine.columns:
-    raise ValueError("stats_ntile_group column not found in inference dataset! This is required for partitioned inference.")
-
-# Check group distribution
-print("\n📊 Inference records per group:")
-group_dist = inference_spine.group_by("stats_ntile_group").count().sort("stats_ntile_group")
-group_dist.show()
-
-# Materialize all features from FeatureView
-print("⏳ Materializing features from Feature Store...")
-all_features_df = feature_view.get_features()
-
-# Join spine with features to get only features for inference entities
-print("⏳ Joining spine with features...")
-inference_df = inference_spine.join(
-    all_features_df,
-    on=["customer_id", "brand_pres_ret", "week"],
-    how="inner"
-)
-
-print(f"\n✅ Inference features loaded from Feature Store")
-print(f"   Total records: {inference_df.count():,}")
-print(f"   Unique customers: {inference_df.select('customer_id').distinct().count():,}")
-
-# Show sample
-print("\n📋 Sample inference features:")
-inference_df.select(
-    'customer_id', 'week', 'brand_pres_ret', 'stats_ntile_group',
-    'sum_past_12_weeks', 'week_of_year'
-).show(5)
+print(f"✅ Loaded {n_records:,} records from INFERENCE_DATASET_CLEANED (sin Feature Store)")
+inference_df.select("customer_id", "week", "brand_pres_ret", partition_col, "sum_past_12_weeks", "week_of_year").show(5)
 
 # %% [markdown]
-# ## 3. Prepare Inference Input
+# ## 3. Prepare inference input (misma lógica que 02/04: excluir metadata, solo numéricas)
 
 # %%
 print("\n" + "="*80)
 print("🔧 PREPARING INFERENCE INPUT")
 print("="*80)
 
-# Define excluded columns (metadata columns from Feature Store)
+# Misma exclusión que script 04 (train_segment_model): no son features
 excluded_cols = [
-    'customer_id', 'brand_pres_ret', 'week', 
-    'FEATURE_TIMESTAMP'  # Feature Store timestamp column
+    "customer_id", "brand_pres_ret", "week",
+    "FEATURE_TIMESTAMP",
+    partition_col,
+]
+excluded_upper = {c.upper() for c in excluded_cols}
+
+inference_df.write.mode('overwrite').save_as_table('BD_AA_DEV.SC_STORAGE_BMX_PS.INFERENCE_INPUT_TEMP')
+
+temp_table = session.table('BD_AA_DEV.SC_STORAGE_BMX_PS.INFERENCE_INPUT_TEMP')
+actual_cols = temp_table.columns
+temp_schema = session.sql("DESCRIBE TABLE BD_AA_DEV.SC_STORAGE_BMX_PS.INFERENCE_INPUT_TEMP").collect()
+col_type_dict = {row['name'].upper(): str(row['type']).upper() for row in temp_schema}
+
+# Solo columnas numéricas y no excluidas, en el orden de la tabla (igual que 04 con dtype.kind in 'iufb')
+NUMERIC_PREFIXES = ("FLOAT", "NUMBER", "INTEGER", "BIGINT", "DOUBLE")
+feature_cols_actual = [
+    c for c in actual_cols
+    if c.upper() not in excluded_upper
+    and (col_type_dict.get(c.upper()) or "").startswith(NUMERIC_PREFIXES)
 ]
 
-# Get feature columns (same as training)
-inference_columns = inference_df.columns
-feature_cols = [col for col in inference_columns 
-                if col not in excluded_cols]
+customer_id_col = next((c for c in actual_cols if c.upper() == "CUSTOMER_ID"), "CUSTOMER_ID")
+brand_col = next((c for c in actual_cols if c.upper() == "BRAND_PRES_RET"), "BRAND_PRES_RET")
+week_col = next((c for c in actual_cols if c.upper() == "WEEK"), "WEEK")
+partition_col_actual = next((c for c in actual_cols if c.upper() == partition_col.upper()), partition_col)
 
-print(f"\n📋 Features for inference ({len(feature_cols)}):")
-for col in sorted(feature_cols):
-    print(f"   - {col}")
-
-# Use stats_ntile_group as partition column (no dummy needed!)
-# Save to temporary table for inference
-inference_input = inference_df
-
-inference_input.write.mode('overwrite').save_as_table(
-    'BD_AA_DEV.SC_STORAGE_BMX_PS.INFERENCE_INPUT_TEMP'
-)
-
-print(f"\n✅ Inference input prepared and saved to temporary table")
-print(f"   Records: {inference_input.count():,}")
-print(f"   Partition column: stats_ntile_group")
+print(f"✅ {len(feature_cols_actual)} features, partition: {partition_col_actual}")
 
 # %% [markdown]
-# ## 4. Execute Partitioned Inference
+# ## 4. Execute partitioned inference
 
 # %%
 print("\n" + "="*80)
 print("🚀 EXECUTING PARTITIONED INFERENCE")
 print("="*80)
 
-print("\n📝 Running partitioned inference...")
-print("   Syntax: TABLE(model!PREDICT(...) OVER (PARTITION BY stats_ntile_group))")
-print("   This routes each group to its specific trained model automatically\n")
-
 start_time = time.time()
-
-# Build feature list for PREDICT function
-# We need to pass features in the same order as training
-feature_list = ", ".join([f"i.{col}" for col in feature_cols])
+# Pass columns as-is; model was registered with sample_input from training (same types).
+feature_list = ", ".join(f"i.{col}" for col in feature_cols_actual)
 
 predictions_sql = f"""
 WITH model_predictions AS (
     SELECT 
         p.customer_id,
-        p.stats_ntile_group,
+        p.{partition_col_actual},
         p.predicted_uni_box_week
     FROM BD_AA_DEV.SC_STORAGE_BMX_PS.INFERENCE_INPUT_TEMP i,
         TABLE(
             BD_AA_DEV.SC_MODELS_BMX.UNI_BOX_REGRESSION_PARTITIONED!PREDICT(
-                i.customer_id,
+                i.{customer_id_col},
+                i.{partition_col_actual},
                 {feature_list}
-            ) OVER (PARTITION BY i.stats_ntile_group)
+            ) OVER (PARTITION BY i.{partition_col_actual})
         ) p
 )
 SELECT 
     mp.customer_id,
-    mp.stats_ntile_group,
-    i.week,
-    i.brand_pres_ret,
+    mp.{partition_col_actual},
+    i.{week_col},
+    i.{brand_col},
     ROUND(mp.predicted_uni_box_week, 2) AS predicted_uni_box_week
 FROM model_predictions mp
 JOIN BD_AA_DEV.SC_STORAGE_BMX_PS.INFERENCE_INPUT_TEMP i 
-    ON mp.customer_id = i.customer_id 
-    AND mp.stats_ntile_group = i.stats_ntile_group
-ORDER BY mp.stats_ntile_group, mp.customer_id
+    ON mp.customer_id = i.{customer_id_col}
+    AND mp.{partition_col_actual} = i.{partition_col_actual}
+ORDER BY mp.{partition_col_actual}, mp.customer_id
 """
 
 predictions_df = session.sql(predictions_sql)
 prediction_count = predictions_df.count()
 inference_time = time.time() - start_time
 
-print(f"✅ Inference complete!")
-print(f"   ⏱️  Time: {inference_time:.2f} seconds")
-print(f"   📊 Predictions: {prediction_count:,}")
-
-print("\n📊 Sample Predictions:")
+print(f"✅ Done in {inference_time:.2f}s — {prediction_count:,} predictions")
 predictions_df.show(10)
 
 # %% [markdown]
-# ## 5. Analyze Prediction Statistics
+# ## 5. Statistics
 
 # %%
-print("\n" + "="*80)
-print("📈 PREDICTION STATISTICS")
-print("="*80)
-
-stats_sql = """
+stats_sql = f"""
 WITH model_predictions AS (
     SELECT 
         p.customer_id,
@@ -239,35 +159,10 @@ WITH model_predictions AS (
     FROM BD_AA_DEV.SC_STORAGE_BMX_PS.INFERENCE_INPUT_TEMP i,
         TABLE(
             BD_AA_DEV.SC_MODELS_BMX.UNI_BOX_REGRESSION_PARTITIONED!PREDICT(
-                i.customer_id,
-                i.sum_past_12_weeks,
-                i.avg_past_12_weeks,
-                i.max_past_24_weeks,
-                i.sum_past_24_weeks,
-                i.week_of_year,
-                i.avg_avg_daily_all_hours,
-                i.sum_p4w,
-                i.avg_past_24_weeks,
-                i.pharm_super_conv,
-                i.wines_liquor,
-                i.groceries,
-                i.max_prev2,
-                i.avg_prev2,
-                i.max_prev3,
-                i.avg_prev3,
-                i.w_m1_total,
-                i.w_m2_total,
-                i.w_m3_total,
-                i.w_m4_total,
-                i.spec_foods,
-                i.prod_key,
-                i.num_coolers,
-                i.num_doors,
-                i.max_past_4_weeks,
-                i.sum_past_4_weeks,
-                i.avg_past_4_weeks,
-                i.max_past_12_weeks
-            ) OVER (PARTITION BY i.stats_ntile_group)
+                i.{customer_id_col},
+                i.{partition_col_actual},
+                {feature_list}
+            ) OVER (PARTITION BY i.{partition_col_actual})
         ) p
 )
 SELECT
@@ -283,18 +178,12 @@ SELECT
 FROM model_predictions
 """
 
-print("\n📊 Overall Statistics:")
 session.sql(stats_sql).show()
 
 # %% [markdown]
-# ## 6. Save Predictions to Inference Logs
+# ## 6. Save to INFERENCE_LOGS
 
 # %%
-print("\n" + "="*80)
-print("💾 SAVING PREDICTIONS TO INFERENCE LOGS")
-print("="*80)
-
-# Create inference logs table
 session.sql("""
     CREATE TABLE IF NOT EXISTS BD_AA_DEV.SC_STORAGE_BMX_PS.INFERENCE_LOGS (
         customer_id VARCHAR,
@@ -306,84 +195,43 @@ session.sql("""
         model_version VARCHAR
     )
 """).collect()
-
-# Clear previous logs (optional - for demo purposes)
-# session.sql("DELETE FROM BD_AA_DEV.SC_STORAGE_BMX_PS.INFERENCE_LOGS").collect()
-
-# Insert predictions
 insert_sql = f"""
 INSERT INTO BD_AA_DEV.SC_STORAGE_BMX_PS.INFERENCE_LOGS
     (customer_id, week, brand_pres_ret, stats_ntile_group, predicted_uni_box_week, model_version)
 WITH model_predictions AS (
     SELECT 
         p.customer_id,
-        p.stats_ntile_group,
+        p.{partition_col_actual},
         p.predicted_uni_box_week
     FROM BD_AA_DEV.SC_STORAGE_BMX_PS.INFERENCE_INPUT_TEMP i,
         TABLE(
             BD_AA_DEV.SC_MODELS_BMX.UNI_BOX_REGRESSION_PARTITIONED!PREDICT(
-                i.customer_id,
+                i.{customer_id_col},
+                i.{partition_col_actual},
                 {feature_list}
-            ) OVER (PARTITION BY i.stats_ntile_group)
+            ) OVER (PARTITION BY i.{partition_col_actual})
         ) p
 )
 SELECT 
     mp.customer_id,
-    i.week,
-    i.brand_pres_ret,
-    mp.stats_ntile_group,
+    i.{week_col},
+    i.{brand_col},
+    mp.{partition_col_actual},
     mp.predicted_uni_box_week,
     '{model_version.version_name}'
 FROM model_predictions mp
 JOIN BD_AA_DEV.SC_STORAGE_BMX_PS.INFERENCE_INPUT_TEMP i 
-    ON mp.customer_id = i.customer_id 
-    AND mp.stats_ntile_group = i.stats_ntile_group
+    ON mp.customer_id = i.{customer_id_col}
+    AND mp.{partition_col_actual} = i.{partition_col_actual}
 """
 
 session.sql(insert_sql).collect()
-
 log_count = session.sql("SELECT COUNT(*) as CNT FROM BD_AA_DEV.SC_STORAGE_BMX_PS.INFERENCE_LOGS").collect()[0]['CNT']
-print(f"✅ Saved {log_count:,} predictions to INFERENCE_LOGS")
-
-print("\n📋 Sample from logs:")
-session.sql("""
-    SELECT * FROM BD_AA_DEV.SC_STORAGE_BMX_PS.INFERENCE_LOGS 
-    ORDER BY inference_timestamp DESC
-    LIMIT 5
-""").show()
+print(f"✅ Saved {log_count:,} to INFERENCE_LOGS")
+session.sql("SELECT * FROM BD_AA_DEV.SC_STORAGE_BMX_PS.INFERENCE_LOGS ORDER BY inference_timestamp DESC LIMIT 5").show()
 
 # %% [markdown]
 # ## 7. Summary
 
 # %%
-print("\n" + "="*80)
-print("🎉 PARTITIONED INFERENCE BATCH COMPLETE!")
-print("="*80)
-
-print(f"""
-📊 Summary:
-   ✅ Predictions generated: {prediction_count:,}
-   ✅ Inference time: {inference_time:.2f} seconds
-   ✅ Logs saved to: INFERENCE_LOGS
-   ✅ Model version: {model_version.version_name}
-
-💡 Key Advantages of Partitioned Model:
-   ✅ 16 group-specific models combined into one
-   ✅ Automatic routing by stats_ntile_group
-   ✅ Each group uses optimized hyperparameters
-   ✅ SQL-native inference (no Python required)
-   ✅ Parallel execution handled by Snowflake
-
-🎯 Business Impact:
-   • Batch predictions for all inference records
-   • Predictions stored for monitoring and analysis
-   • Ready for production deployment
-   • Scalable to multiple models if needed
-
-🚀 Next Steps:
-   → Review predictions in INFERENCE_LOGS table
-   → Set up monitoring and observability
-   → Schedule regular batch inference runs
-""")
-
-print("="*80)
+print(f"\n🎉 Done — {prediction_count:,} predictions, {inference_time:.2f}s, model {model_version.version_name}")
