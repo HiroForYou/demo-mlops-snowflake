@@ -163,27 +163,28 @@ WITH model_predictions AS (
     SELECT 
         p.customer_id,
         p.{partition_col_actual},
+        p.{week_col},
+        p.{brand_col},
         p.predicted_uni_box_week
     FROM BD_AA_DEV.SC_STORAGE_BMX_PS.INFERENCE_INPUT_TEMP i,
         TABLE(
             BD_AA_DEV.SC_MODELS_BMX.UNI_BOX_REGRESSION_PARTITIONED!PREDICT(
                 i.{customer_id_col},
                 i.{partition_col_actual},
+                i.{week_col},
+                i.{brand_col},
                 {feature_list}
             ) OVER (PARTITION BY i.{partition_col_actual})
         ) p
 )
 SELECT 
-    mp.customer_id,
-    mp.{partition_col_actual},
-    i.{week_col},
-    i.{brand_col},
-    ROUND(mp.predicted_uni_box_week, 2) AS predicted_uni_box_week
-FROM model_predictions mp
-JOIN BD_AA_DEV.SC_STORAGE_BMX_PS.INFERENCE_INPUT_TEMP i 
-    ON mp.customer_id = i.{customer_id_col}
-    AND mp.{partition_col_actual} = i.{partition_col_actual}
-ORDER BY mp.{partition_col_actual}, mp.customer_id
+    customer_id,
+    {partition_col_actual} AS {partition_col_actual},
+    {week_col} AS {week_col},
+    {brand_col} AS {brand_col},
+    ROUND(predicted_uni_box_week, 2) AS predicted_uni_box_week
+FROM model_predictions
+ORDER BY {partition_col_actual}, customer_id
 """
 
 predictions_df = session.sql(predictions_sql)
@@ -207,6 +208,8 @@ WITH model_predictions AS (
             BD_AA_DEV.SC_MODELS_BMX.UNI_BOX_REGRESSION_PARTITIONED!PREDICT(
                 i.{customer_id_col},
                 i.{partition_col_actual},
+                i.{week_col},
+                i.{brand_col},
                 {feature_list}
             ) OVER (PARTITION BY i.{partition_col_actual})
         ) p

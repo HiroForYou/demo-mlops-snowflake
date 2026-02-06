@@ -80,7 +80,15 @@ class PartitionedUniBoxModel(custom_model.CustomModel):
     def predict(self, input_df: pd.DataFrame) -> pd.DataFrame:
         """Predicción por grupo; enruta según stats_ntile_group."""
         if len(input_df) == 0:
-            return pd.DataFrame(columns=["customer_id", "stats_ntile_group", "predicted_uni_box_week"])
+            return pd.DataFrame(
+                columns=[
+                    "customer_id",
+                    "stats_ntile_group",
+                    "week",
+                    "brand_pres_ret",
+                    "predicted_uni_box_week",
+                ]
+            )
 
         part_col = "stats_ntile_group" if "stats_ntile_group" in input_df.columns else "STATS_NTILE_GROUP"
         group_name = input_df[part_col].iloc[0]
@@ -106,12 +114,30 @@ class PartitionedUniBoxModel(custom_model.CustomModel):
         else:
             predictions = np.asarray(pred_out).ravel()
 
-        cust = input_df["customer_id"].values if "customer_id" in input_df.columns else np.arange(len(predictions))
-        return pd.DataFrame({
-            "customer_id": cust,
-            "stats_ntile_group": group_name,
-            "predicted_uni_box_week": predictions,
-        })
+        # Propagar columnas de contexto para evitar JOINs ambiguos en inferencia
+        cust = (
+            input_df["customer_id"].values
+            if "customer_id" in input_df.columns
+            else np.arange(len(predictions))
+        )
+        week_vals = (
+            input_df["week"].values if "week" in input_df.columns else [None] * len(predictions)
+        )
+        brand_vals = (
+            input_df["brand_pres_ret"].values
+            if "brand_pres_ret" in input_df.columns
+            else [None] * len(predictions)
+        )
+
+        return pd.DataFrame(
+            {
+                "customer_id": cust,
+                "stats_ntile_group": group_name,
+                "week": week_vals,
+                "brand_pres_ret": brand_vals,
+                "predicted_uni_box_week": predictions,
+            }
+        )
 
 
 print("✅ PartitionedUniBoxModel class defined")
@@ -136,7 +162,7 @@ partitioned_model = PartitionedUniBoxModel(model_context=model_context)
 print("✅ Partitioned model created")
 
 # %% [markdown]
-# ## 4. Sample input (misma lógica de exclusión que 02/04/06 para homologar firma de PREDICT)
+# ## 4. Sample input (homologado con 06: incluye week y brand_pres_ret como contexto)
 
 # %%
 print("\n" + "=" * 80)
@@ -185,16 +211,24 @@ else:
 
 training_df = session.table("BD_AA_DEV.SC_STORAGE_BMX_PS.TRAIN_DATASET_CLEANED")
 sample_input_sp = (
-    training_df.select("customer_id", "stats_ntile_group", *feature_cols_for_sample)
+    training_df.select("customer_id", "stats_ntile_group", "week", "brand_pres_ret", *feature_cols_for_sample)
     .filter(training_df["stats_ntile_group"].isin(list(loaded_models.keys())))
     .group_by("stats_ntile_group")
-    .agg(*[F.min(F.col(c)).alias(c) for c in ["customer_id"] + feature_cols_for_sample])
-    .select("customer_id", "stats_ntile_group", *feature_cols_for_sample)
+    .agg(
+        # Asegurar NO-NULL en columnas de contexto para inferir firma (Snowflake ML requiere al menos un no-null)
+        F.min(F.col("customer_id")).alias("customer_id"),
+        F.coalesce(F.min(F.col("week")), F.lit("000000")).alias("week"),
+        F.coalesce(F.min(F.col("brand_pres_ret")), F.lit("UNKNOWN")).alias("brand_pres_ret"),
+        *[F.min(F.col(c)).alias(c) for c in feature_cols_for_sample],
+    )
+    .select("customer_id", "stats_ntile_group", "week", "brand_pres_ret", *feature_cols_for_sample)
     .limit(min(16, len(loaded_models)))
 )
 sample_input = sample_input_sp.to_pandas()
 print(f"✅ Sample input prepared: {len(sample_input)} rows (one per group)")
-print(f"   Columns: customer_id, stats_ntile_group, {len(feature_cols_for_sample)} features")
+print(f"   Columns: customer_id, stats_ntile_group, week, brand_pres_ret, {len(feature_cols_for_sample)} features")
+if len(sample_input) == 0:
+    raise ValueError("Sample input is empty. Verifica que TRAIN_DATASET_CLEANED tenga los mismos stats_ntile_group que los modelos cargados.")
 
 # %% [markdown]
 # ## 5. Register Partitioned Model
@@ -228,8 +262,21 @@ try:
     )
 
     print("\n✅ Partitioned model registered successfully!")
-    mv.set_alias("PRODUCTION")
-    print(f"🏷️  Alias 'PRODUCTION' configured")
+    # Mover alias PRODUCTION de forma "limpia":
+    # 1) quitar alias al version previo (si existe)
+    # 2) asignar alias al nuevo version
+    model_fqn = "BD_AA_DEV.SC_MODELS_BMX.UNI_BOX_REGRESSION_PARTITIONED"
+    new_version_name = f"V_{version_date}"
+    try:
+        session.sql(f"ALTER MODEL {model_fqn} VERSION PRODUCTION UNSET ALIAS").collect()
+        print("🧹 Alias 'PRODUCTION' removido del version anterior")
+    except Exception as alias_unset_err:
+        print(f"ℹ️  No se pudo remover alias previo (puede no existir): {str(alias_unset_err)[:120]}")
+
+    session.sql(
+        f"ALTER MODEL {model_fqn} VERSION {new_version_name} SET ALIAS='PRODUCTION'"
+    ).collect()
+    print("🏷️  Alias 'PRODUCTION' movido al nuevo version")
 
 except Exception as e:
     print(f"\n❌ Error registering model: {str(e)}")
