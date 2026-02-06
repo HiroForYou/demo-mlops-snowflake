@@ -113,8 +113,38 @@ for c in inference_df.columns:
         if col_type.startswith(NUMERIC_PREFIXES):
             cols_to_keep.append(c)
 
-inference_input_df = inference_df.select(cols_to_keep)
-inference_input_df.write.mode("overwrite").save_as_table("BD_AA_DEV.SC_STORAGE_BMX_PS.INFERENCE_INPUT_TEMP")
+INFERENCE_INPUT_TEMP = "BD_AA_DEV.SC_STORAGE_BMX_PS.INFERENCE_INPUT_TEMP"
+
+# Materializar temp con casts explícitos en columnas de contexto para calzar con la firma del modelo (VARCHAR).
+# (Si WEEK llega como VARCHAR en inferencia pero el modelo espera NUMBER, PREDICT falla por tipos.)
+cols_upper = {c.upper(): c for c in cols_to_keep}
+cust_c = cols_upper.get("CUSTOMER_ID", "CUSTOMER_ID")
+week_c = cols_upper.get("WEEK", "WEEK")
+brand_c = cols_upper.get("BRAND_PRES_RET", "BRAND_PRES_RET")
+part_c = cols_upper.get(partition_col.upper(), partition_col)
+
+def _q(ident: str) -> str:
+    # Quote simple para identifiers (mantener compatibilidad con mayúsculas/minúsculas y caracteres especiales)
+    return f'"{ident}"'
+
+select_exprs = [
+    f"CAST({_q(cust_c)} AS VARCHAR) AS CUSTOMER_ID",
+    f"CAST({_q(part_c)} AS VARCHAR) AS {partition_col.upper()}",
+    f"CAST({_q(week_c)} AS VARCHAR) AS WEEK",
+    f"CAST({_q(brand_c)} AS VARCHAR) AS BRAND_PRES_RET",
+]
+
+# Features numéricas (sin casts; deben permanecer numéricas)
+for c in feature_cols_actual:
+    # usar el nombre real según cols_to_keep (si aplica)
+    real_c = next((x for x in cols_to_keep if x.upper() == c.upper()), c)
+    select_exprs.append(f"{_q(real_c)} AS {_q(real_c)}")
+
+session.sql(
+    f"CREATE OR REPLACE TABLE {INFERENCE_INPUT_TEMP} AS SELECT\n  "
+    + ",\n  ".join(select_exprs)
+    + "\nFROM BD_AA_DEV.SC_STORAGE_BMX_PS.INFERENCE_DATASET_CLEANED"
+).collect()
 
 temp_table = session.table("BD_AA_DEV.SC_STORAGE_BMX_PS.INFERENCE_INPUT_TEMP")
 actual_cols = temp_table.columns
@@ -161,7 +191,7 @@ feature_list = ", ".join(f"i.{col}" for col in feature_cols_actual)
 predictions_sql = f"""
 WITH model_predictions AS (
     SELECT 
-        p.customer_id,
+        p.{customer_id_col},
         p.{partition_col_actual},
         p.{week_col},
         p.{brand_col},
@@ -178,13 +208,13 @@ WITH model_predictions AS (
         ) p
 )
 SELECT 
-    customer_id,
+    {customer_id_col} AS {customer_id_col},
     {partition_col_actual} AS {partition_col_actual},
     {week_col} AS {week_col},
     {brand_col} AS {brand_col},
     ROUND(predicted_uni_box_week, 2) AS predicted_uni_box_week
 FROM model_predictions
-ORDER BY {partition_col_actual}, customer_id
+ORDER BY {partition_col_actual}, {customer_id_col}
 """
 
 predictions_df = session.sql(predictions_sql)
