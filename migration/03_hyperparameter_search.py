@@ -1,8 +1,8 @@
 # %% [markdown]
-# # Migration: Hyperparameter Search (LGBM/XGB/SGD + Snowflake ML Tune) - Per Group
+# # Migration: Hyperparameter Search (LGBM/XGB + Snowflake ML Tune) - Per Group
 #
 # ## Overview
-# This script performs hyperparameter optimization using Snowflake ML's tune.search for regression (LGBM, XGBoost, SGD per group).
+# This script performs hyperparameter optimization using Snowflake ML's tune.search for regression (LGBM, XGBoost per group).
 # **Runs HPO per group in a sequential loop (no MMT) to avoid Ray serialization issues; each group runs its own Random Search.**
 #
 # ## What We'll Do:
@@ -46,7 +46,9 @@ USE_CLEANED_TABLES = (
     False  # True = TRAIN_DATASET_CLEANED, False = intentar Feature Store
 )
 
-# Un solo objeto: grupo -> nombre de clase Snowflake ML (snowflake.ml.modeling.*)
+# Un solo objeto: grupo -> nombre de clase Snowflake ML (snowflake.ml.modeling.*).
+# NOTA: originalmente algunos grupos usaban `SGDRegressor`; ahora todos los grupos usan
+# modelos de boosting (XGB/LGBM) para regresión.
 GROUP_MODEL = {
     "group_stat_0_1": "LGBMRegressor",
     "group_stat_0_2": "LGBMRegressor",
@@ -55,7 +57,7 @@ GROUP_MODEL = {
     "group_stat_1_1": "LGBMRegressor",
     "group_stat_1_2": "LGBMRegressor",
     "group_stat_1_3": "XGBRegressor",
-    "group_stat_1_4": "SGDRegressor",
+    "group_stat_1_4": "XGBRegressor",
     "group_stat_2_1": "LGBMRegressor",
     "group_stat_2_2": "LGBMRegressor",
     "group_stat_2_3": "XGBRegressor",
@@ -63,7 +65,7 @@ GROUP_MODEL = {
     "group_stat_3_1": "LGBMRegressor",
     "group_stat_3_2": "LGBMRegressor",
     "group_stat_3_3": "LGBMRegressor",
-    "group_stat_3_4": "SGDRegressor",
+    "group_stat_3_4": "XGBRegressor",
 }
 _DEFAULT_MODEL = "XGBRegressor"
 
@@ -168,7 +170,7 @@ print("\n" + "=" * 80)
 print("🎯 DEFINING HYPERPARAMETER SEARCH SPACE")
 print("=" * 80)
 
-# Espacios de búsqueda por tipo de modelo (LGBM, XGBoost, SGD)
+# Espacios de búsqueda por tipo de modelo (LGBM, XGBoost)
 SEARCH_SPACES = {
     "XGBRegressor": {
         "n_estimators": randint(50, 300),
@@ -191,12 +193,6 @@ SEARCH_SPACES = {
         "reg_alpha": uniform(0, 1),
         "reg_lambda": uniform(0, 1),
         "min_child_samples": randint(5, 50),
-    },
-    "SGDRegressor": {
-        "alpha": uniform(1e-5, 1e-2),
-        "max_iter": randint(1000, 5000),
-        "tol": uniform(1e-5, 1e-2),
-        "eta0": uniform(1e-4, 0.01),
     },
 }
 
@@ -373,12 +369,12 @@ all_results = {}
 # %%
 def create_train_func_for_tuner(feature_cols, model_type, target_col):
     """
-    Create a training function for the Tuner (XGBRegressor, LGBMRegressor or SGDRegressor).
+    Create a training function for the Tuner (XGBRegressor or LGBMRegressor).
     Called for each trial with different hyperparameters; model_type selects the regressor class.
 
     Args:
         feature_cols: List of feature column names
-        model_type: "XGBRegressor", "LGBMRegressor", or "SGDRegressor"
+        model_type: "XGBRegressor" or "LGBMRegressor"
         target_col: Actual target column name in dataset (e.g. uni_box_week or UNI_BOX_WEEK)
 
     Returns:
@@ -443,9 +439,35 @@ def create_train_func_for_tuner(feature_cols, model_type, target_col):
         pred_df = pred_result.to_pandas() if hasattr(pred_result, "to_pandas") else pred_result
         out_col = model.get_output_cols()[0]
         y_val_pred = np.asarray(pred_df[out_col])
+
+        # Métricas de regresión
         val_rmse = np.sqrt(mean_squared_error(y_val, y_val_pred))
         val_mae = mean_absolute_error(y_val, y_val_pred)
-        tuner_context.report(metrics={"rmse": val_rmse, "mae": val_mae}, model=model)
+
+        # WAPE: sum(|y - y_hat|) / sum(|y|)
+        abs_errors = np.abs(y_val - y_val_pred)
+        denom_wape = np.sum(np.abs(y_val))
+        val_wape = float(abs_errors.sum() / denom_wape) if denom_wape > 0 else 0.0
+
+        # MAPE: mean(|y - y_hat| / |y|) * 100, ignorando targets 0
+        non_zero_mask = np.abs(y_val) > 1e-8
+        if non_zero_mask.any():
+            val_mape = float(
+                (np.abs(y_val[non_zero_mask] - y_val_pred[non_zero_mask]) / np.abs(y_val[non_zero_mask])).mean()
+                * 100.0
+            )
+        else:
+            val_mape = 0.0
+
+        tuner_context.report(
+            metrics={
+                "rmse": val_rmse,
+                "mae": val_mae,
+                "wape": val_wape,
+                "mape": val_mape,
+            },
+            model=model,
+        )
 
     return train_func
 
@@ -599,12 +621,30 @@ def run_hyperparameter_search_for_one_group(group_name, group_df):
         pred_df = pred_result.to_pandas() if hasattr(pred_result, "to_pandas") else pred_result
         out_col = best_model.get_output_cols()[0]
         y_val_pred = np.asarray(pred_df[out_col])
+
+        # Métricas de validación
         val_rmse = np.sqrt(mean_squared_error(y_val, y_val_pred))
         val_mae = mean_absolute_error(y_val, y_val_pred)
 
+        abs_errors = np.abs(y_val - y_val_pred)
+        denom_wape = np.sum(np.abs(y_val))
+        val_wape = float(abs_errors.sum() / denom_wape) if denom_wape > 0 else 0.0
+
+        non_zero_mask = np.abs(y_val) > 1e-8
+        if non_zero_mask.any():
+            val_mape = float(
+                (np.abs(y_val[non_zero_mask] - y_val_pred[non_zero_mask]) / np.abs(y_val[non_zero_mask])).mean()
+                * 100.0
+            )
+        else:
+            val_mape = 0.0
+
         print(f"   ✅ Completed in {elapsed_time:.1f}s")
         print(f"      Best RMSE: {best_rmse:.4f}")
-        print(f"      Val RMSE: {val_rmse:.4f}, Val MAE: {val_mae:.4f}")
+        print(
+            f"      Val RMSE: {val_rmse:.4f}, Val MAE: {val_mae:.4f}, "
+            f"WAPE: {val_wape:.4f}, MAPE: {val_mape:.2f}%"
+        )
 
         # Store results in global dictionary (for summary later)
         all_results[group_name] = {
@@ -612,6 +652,8 @@ def run_hyperparameter_search_for_one_group(group_name, group_df):
             "best_cv_rmse": best_rmse,
             "val_rmse": val_rmse,
             "val_mae": val_mae,
+            "val_wape": val_wape,
+            "val_mape": val_mape,
             "sample_size": sampled_count,
             "algorithm": model_type,
         }
@@ -634,6 +676,8 @@ def run_hyperparameter_search_for_one_group(group_name, group_df):
                             "best_rmse": float(best_rmse),
                             "val_rmse": float(val_rmse),
                             "val_mae": float(val_mae),
+                            "val_wape": float(val_wape),
+                            "val_mape": float(val_mape),
                             "sample_size": int(sampled_count),
                             "num_trials": int(num_trials),
                         }

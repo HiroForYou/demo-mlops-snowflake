@@ -1,5 +1,5 @@
 # %% [markdown]
-# # MMT: 16 modelos (LGBM/XGB/SGD por stats_ntile_group)
+# # MMT: 16 modelos (LGBM/XGB por stats_ntile_group)
 # Hiperparámetros por grupo desde script 03 → entrenar → registrar en Model Registry.
 
 # %%
@@ -31,7 +31,7 @@ GROUP_MODEL = {
     "group_stat_1_1": "LGBMRegressor",
     "group_stat_1_2": "LGBMRegressor",
     "group_stat_1_3": "XGBRegressor",
-    "group_stat_1_4": "SGDRegressor",
+    "group_stat_1_4": "XGBRegressor",
     "group_stat_2_1": "LGBMRegressor",
     "group_stat_2_2": "LGBMRegressor",
     "group_stat_2_3": "XGBRegressor",
@@ -39,7 +39,7 @@ GROUP_MODEL = {
     "group_stat_3_1": "LGBMRegressor",
     "group_stat_3_2": "LGBMRegressor",
     "group_stat_3_3": "LGBMRegressor",
-    "group_stat_3_4": "SGDRegressor",
+    "group_stat_3_4": "XGBRegressor",
 }
 _DEFAULT_MODEL = "XGBRegressor"
 
@@ -604,16 +604,37 @@ def train_segment_model(data_connector, context):
     pred_df = pred_result.to_pandas() if hasattr(pred_result, "to_pandas") else pred_result
     out_col = model.get_output_cols()[0]
     y_pred = np.asarray(pred_df[out_col])
+
+    # Métricas de regresión
     rmse = np.sqrt(mean_squared_error(y_test, y_pred))
     mae = mean_absolute_error(y_test, y_pred)
+
+    # WAPE: sum(|y - y_hat|) / sum(|y|)
+    abs_errors = np.abs(y_test - y_pred)
+    denom_wape = np.sum(np.abs(y_test))
+    wape = float(abs_errors.sum() / denom_wape) if denom_wape > 0 else 0.0
+
+    # MAPE: mean(|y - y_hat| / |y|) * 100, ignorando targets 0
+    non_zero_mask = np.abs(y_test) > 1e-8
+    if non_zero_mask.any():
+        mape = float(
+            (np.abs(y_test[non_zero_mask] - y_pred[non_zero_mask]) / np.abs(y_test[non_zero_mask])).mean()
+            * 100.0
+        )
+    else:
+        mape = 0.0
 
     print(f"\n   ✅ Model trained")
     print(f"      RMSE: {rmse:.2f}")
     print(f"      MAE: {mae:.2f}")
+    print(f"      WAPE: {wape:.4f}")
+    print(f"      MAPE: {mape:.2f}%")
     print(f"{'='*80}\n")
 
     model.rmse = rmse
     model.mae = mae
+    model.wape = wape
+    model.mape = mape
     model.training_samples = X_train.shape[0]
     model.test_samples = X_test.shape[0]
     model.feature_cols = feature_cols
@@ -785,6 +806,8 @@ for partition_id in _reg_partitions:
             model_metrics = {
                 "rmse": float(model.rmse),
                 "mae": float(model.mae),
+                "wape": float(model.wape),
+                "mape": float(model.mape),
                 "training_samples": int(model.training_samples),
                 "test_samples": int(model.test_samples),
                 "algorithm": group_algorithm,
@@ -821,7 +844,10 @@ for partition_id in _reg_partitions:
             }
 
             print(f"✅ {partition_id}: {model_name} v_{version_date}")
-            print(f"   RMSE: {model.rmse:.2f}, MAE: {model.mae:.2f}")
+            print(
+                f"   RMSE: {model.rmse:.2f}, MAE: {model.mae:.2f}, "
+                f"WAPE: {model.wape:.4f}, MAPE: {model.mape:.2f}%"
+            )
 
         except Exception as e:
             print(f"❌ Error registering model: {str(e)[:200]}")
@@ -858,7 +884,10 @@ if registered_models:
     for pid in sorted(registered_models.keys()):
         try:
             m = training_run.get_model(pid)
-            print(f"   {pid}: RMSE={m.rmse:.2f}, MAE={m.mae:.2f}")
+            print(
+                f"   {pid}: RMSE={m.rmse:.2f}, MAE={m.mae:.2f}, "
+                f"WAPE={m.wape:.4f}, MAPE={m.mape:.2f}%"
+            )
         except Exception:
             pass
 print("   Siguiente: 05_create_partitioned_model.py → 06_partitioned_inference_batch.py")

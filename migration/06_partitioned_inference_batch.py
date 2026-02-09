@@ -1,316 +1,134 @@
 # %% [markdown]
-# # Partitioned Inference Batch
-# Load inference data, run TABLE(model!PREDICT(...) OVER (PARTITION BY stats_ntile_group)), save to INFERENCE_LOGS.
+# # Partitioned Inference — UNI_BOX_REGRESSION_PARTITIONED
+#
+# Inference usando alias **PRODUCTION** directamente, con SAMPLE opcional.
 
 # %%
 from snowflake.snowpark.context import get_active_session
-from snowflake.ml.registry import Registry
 import time
 
-session = get_active_session()
-session.sql("USE DATABASE BD_AA_DEV").collect()
-session.sql("USE SCHEMA SC_STORAGE_BMX_PS").collect()
-
-registry = Registry(
-    session=session,
-    database_name="BD_AA_DEV",
-    schema_name="SC_MODELS_BMX"
-)
-
+# %%
 INFERENCE_SAMPLE_FRACTION = 0.01
 
+DATABASE = "BD_AA_DEV"
+STORAGE_SCHEMA = "SC_STORAGE_BMX_PS"
+MODEL_SCHEMA = "SC_MODELS_BMX"
+
+SOURCE_TABLE = f"{DATABASE}.{STORAGE_SCHEMA}.INFERENCE_INPUT_TEMP"
+MODEL_FQN = f"{DATABASE}.{MODEL_SCHEMA}.UNI_BOX_REGRESSION_PARTITIONED"
+
+# %%
+session = get_active_session()
+session.sql(f"USE DATABASE {DATABASE}").collect()
+session.sql(f"USE SCHEMA {STORAGE_SCHEMA}").collect()
+
 print("✅ Connected to Snowflake")
-print(f"   Database: {session.get_current_database()}")
-print(f"   Schema: {session.get_current_schema()}")
-if INFERENCE_SAMPLE_FRACTION:
-    print(f"   ⚠️  Sampling: {INFERENCE_SAMPLE_FRACTION*100:.1f}% del dataset de inferencia")
+print("   Model: UNI_BOX_REGRESSION_PARTITIONED (PRODUCTION alias)")
 
 # %% [markdown]
-# ## 1. Verify model
+# ## Input sampling
 
 # %%
-print("\n" + "="*80)
-print("🔍 VERIFYING PARTITIONED MODEL")
-print("="*80)
-
-model_ref = registry.get_model("UNI_BOX_REGRESSION_PARTITIONED")
-model_version = model_ref.version("PRODUCTION")
-print(f"✅ UNI_BOX_REGRESSION_PARTITIONED @ {model_version.version_name} (PRODUCTION)")
+if INFERENCE_SAMPLE_FRACTION is not None and 0 < INFERENCE_SAMPLE_FRACTION < 1:
+    FROM_SQL = (
+        f"{SOURCE_TABLE} i "
+        f"SAMPLE BERNOULLI ({INFERENCE_SAMPLE_FRACTION * 100})"
+    )
+    print(f"⚠️  Using SAMPLE: {INFERENCE_SAMPLE_FRACTION*100:.2f}%")
+else:
+    FROM_SQL = f"{SOURCE_TABLE} i"
+    print("✅ Using FULL dataset")
 
 # %% [markdown]
-# ## 2. Load inference data (directamente desde INFERENCE_DATASET_CLEANED)
-# No se usa Feature Store: inferencia consume la tabla cleaned con las mismas columnas que validó 01 (compatibles con training).
+# ## Partitioned inference (single-pass)
 
 # %%
-print("\n" + "="*80)
-print("📋 LOADING INFERENCE DATA (INFERENCE_DATASET_CLEANED)")
-print("="*80)
-
-inference_df = session.table("BD_AA_DEV.SC_STORAGE_BMX_PS.INFERENCE_DATASET_CLEANED")
-
-partition_col = next((c for c in inference_df.columns if c.upper() == "STATS_NTILE_GROUP"), None)
-if partition_col is None:
-    raise ValueError("stats_ntile_group not found in inference dataset.")
-
-if INFERENCE_SAMPLE_FRACTION and 0 < INFERENCE_SAMPLE_FRACTION < 1:
-    inference_df = inference_df.sample(frac=INFERENCE_SAMPLE_FRACTION)
-
-n_records = inference_df.count()
-print(f"   Inference records: {n_records:,}")
-inference_df.group_by(partition_col).count().sort(partition_col).show()
-
-print(f"✅ Loaded {n_records:,} records from INFERENCE_DATASET_CLEANED (sin Feature Store)")
-inference_df.select("customer_id", "week", "brand_pres_ret", partition_col, "sum_past_12_weeks", "week_of_year").show(5)
-
-# %% [markdown]
-# ## 3. Prepare inference input (misma exclusión que 02/04: solo features numéricas, sin metadata)
-
-# %%
-print("\n" + "="*80)
-print("🔧 PREPARING INFERENCE INPUT")
-print("="*80)
-
-# Misma lista de exclusión que script 02 (Feature Store) y 04: no son features para el modelo
-excluded_cols = [
-    "customer_id",
-    "brand_pres_ret",
-    "week",
-    "group",
-    "stats_group",
-    "percentile_group",
-    "stats_ntile_group",
-    "FEATURE_TIMESTAMP",
-]
-excluded_upper = {c.upper() for c in excluded_cols}
-
-# Obtener esquema de la tabla de inferencia para identificar solo columnas de features (numéricas, no excluidas)
-inference_schema = session.sql(
-    "DESCRIBE TABLE BD_AA_DEV.SC_STORAGE_BMX_PS.INFERENCE_DATASET_CLEANED"
-).collect()
-col_type_dict = {row["name"].upper(): str(row["type"]).upper() for row in inference_schema}
-all_cols = [row["name"] for row in inference_schema]
-
-NUMERIC_PREFIXES = ("FLOAT", "NUMBER", "INTEGER", "BIGINT", "DOUBLE")
-feature_cols_actual = [
-    c for c in all_cols
-    if c.upper() not in excluded_upper
-    and (col_type_dict.get(c.upper()) or "").startswith(NUMERIC_PREFIXES)
-]
-
-# Crear INFERENCE_INPUT_TEMP solo con columnas necesarias: claves + partition + features (lo que espera PREDICT)
-# Excluir group, stats_group, percentile_group y cualquier no-feature (VARCHAR como PROD_KEY) para que PREDICT reciba la firma correcta
-keys_and_partition_upper = {"CUSTOMER_ID", "BRAND_PRES_RET", "WEEK", partition_col.upper()}
-feature_names_upper = {c.upper() for c in feature_cols_actual}
-# Solo incluir columnas que sean: (1) claves/partición, o (2) features numéricas (verificar tipo también)
-cols_to_keep = []
-for c in inference_df.columns:
-    c_upper = c.upper()
-    if c_upper in keys_and_partition_upper:
-        cols_to_keep.append(c)
-    elif c_upper in feature_names_upper:
-        # Verificar que realmente sea numérica (doble verificación)
-        col_type = col_type_dict.get(c_upper, "")
-        if col_type.startswith(NUMERIC_PREFIXES):
-            cols_to_keep.append(c)
-
-INFERENCE_INPUT_TEMP = "BD_AA_DEV.SC_STORAGE_BMX_PS.INFERENCE_INPUT_TEMP"
-
-# Materializar temp con casts explícitos en columnas de contexto para calzar con la firma del modelo (VARCHAR).
-# (Si WEEK llega como VARCHAR en inferencia pero el modelo espera NUMBER, PREDICT falla por tipos.)
-cols_upper = {c.upper(): c for c in cols_to_keep}
-cust_c = cols_upper.get("CUSTOMER_ID", "CUSTOMER_ID")
-week_c = cols_upper.get("WEEK", "WEEK")
-brand_c = cols_upper.get("BRAND_PRES_RET", "BRAND_PRES_RET")
-part_c = cols_upper.get(partition_col.upper(), partition_col)
-
-def _q(ident: str) -> str:
-    # Quote simple para identifiers (mantener compatibilidad con mayúsculas/minúsculas y caracteres especiales)
-    return f'"{ident}"'
-
-select_exprs = [
-    f"CAST({_q(cust_c)} AS VARCHAR) AS CUSTOMER_ID",
-    f"CAST({_q(part_c)} AS VARCHAR) AS {partition_col.upper()}",
-    f"CAST({_q(week_c)} AS VARCHAR) AS WEEK",
-    f"CAST({_q(brand_c)} AS VARCHAR) AS BRAND_PRES_RET",
-]
-
-# Features numéricas (sin casts; deben permanecer numéricas)
-for c in feature_cols_actual:
-    # usar el nombre real según cols_to_keep (si aplica)
-    real_c = next((x for x in cols_to_keep if x.upper() == c.upper()), c)
-    select_exprs.append(f"{_q(real_c)} AS {_q(real_c)}")
-
-session.sql(
-    f"CREATE OR REPLACE TABLE {INFERENCE_INPUT_TEMP} AS SELECT\n  "
-    + ",\n  ".join(select_exprs)
-    + "\nFROM BD_AA_DEV.SC_STORAGE_BMX_PS.INFERENCE_DATASET_CLEANED"
-).collect()
-
-temp_table = session.table("BD_AA_DEV.SC_STORAGE_BMX_PS.INFERENCE_INPUT_TEMP")
-actual_cols = temp_table.columns
-customer_id_col = next((c for c in actual_cols if c.upper() == "CUSTOMER_ID"), "CUSTOMER_ID")
-brand_col = next((c for c in actual_cols if c.upper() == "BRAND_PRES_RET"), "BRAND_PRES_RET")
-week_col = next((c for c in actual_cols if c.upper() == "WEEK"), "WEEK")
-partition_col_actual = next((c for c in actual_cols if c.upper() == partition_col.upper()), partition_col)
-
-# Recalcular feature_cols_actual desde la temp table (asegurar que solo tenga numéricas, sin VARCHAR como PROD_KEY)
-temp_schema = session.sql("DESCRIBE TABLE BD_AA_DEV.SC_STORAGE_BMX_PS.INFERENCE_INPUT_TEMP").collect()
-temp_col_type_dict = {row["name"].upper(): str(row["type"]).upper() for row in temp_schema}
-feature_cols_actual = [
-    c for c in actual_cols
-    if c.upper() not in excluded_upper
-    and (temp_col_type_dict.get(c.upper()) or "").startswith(NUMERIC_PREFIXES)
-]
-
-# Verificar que no haya VARCHARs en features (debug)
-non_numeric_in_features = [
-    c for c in feature_cols_actual
-    if not (temp_col_type_dict.get(c.upper()) or "").startswith(NUMERIC_PREFIXES)
-]
-if non_numeric_in_features:
-    print(f"⚠️  ADVERTENCIA: Columnas no numéricas en features: {non_numeric_in_features}")
-    feature_cols_actual = [c for c in feature_cols_actual if c not in non_numeric_in_features]
-
-print(f"✅ Excluidas (no features): {list(excluded_cols)}")
-print(f"✅ {len(feature_cols_actual)} features numéricas para PREDICT, partition: {partition_col_actual}")
-if len(feature_cols_actual) > 0:
-    print(f"   Primeras 5 features: {feature_cols_actual[:5]}")
-
-# %% [markdown]
-# ## 4. Execute partitioned inference
-
-# %%
-print("\n" + "="*80)
-print("🚀 EXECUTING PARTITIONED INFERENCE")
-print("="*80)
-
+print("🚀 RUNNING PARTITIONED INFERENCE (single-pass)")
 start_time = time.time()
-# Pass columns as-is; model was registered with sample_input from training (same types).
-feature_list = ", ".join(f"i.{col}" for col in feature_cols_actual)
 
-predictions_sql = f"""
-WITH model_predictions AS (
-    SELECT 
-        p.{customer_id_col},
-        p.{partition_col_actual},
-        p.{week_col},
-        p.{brand_col},
-        p.predicted_uni_box_week
-    FROM BD_AA_DEV.SC_STORAGE_BMX_PS.INFERENCE_INPUT_TEMP i,
-        TABLE(
-            BD_AA_DEV.SC_MODELS_BMX.UNI_BOX_REGRESSION_PARTITIONED!PREDICT(
-                i.{customer_id_col},
-                i.{partition_col_actual},
-                i.{week_col},
-                i.{brand_col},
-                {feature_list}
-            ) OVER (PARTITION BY i.{partition_col_actual})
-        ) p
-)
-SELECT 
-    {customer_id_col} AS {customer_id_col},
-    {partition_col_actual} AS {partition_col_actual},
-    {week_col} AS {week_col},
-    {brand_col} AS {brand_col},
-    ROUND(predicted_uni_box_week, 2) AS predicted_uni_box_week
-FROM model_predictions
-ORDER BY {partition_col_actual}, {customer_id_col}
-"""
+inference_sql = f"""
+WITH typed_input AS (
+    SELECT
+        i.CUSTOMER_ID::VARCHAR           AS CUSTOMER_ID,
+        i.STATS_NTILE_GROUP::VARCHAR     AS STATS_NTILE_GROUP,
+        i.WEEK::VARCHAR                  AS WEEK,
+        i.BRAND_PRES_RET::VARCHAR        AS BRAND_PRES_RET,
 
-predictions_df = session.sql(predictions_sql)
-prediction_count = predictions_df.count()
-inference_time = time.time() - start_time
-
-print(f"✅ Done in {inference_time:.2f}s — {prediction_count:,} predictions")
-predictions_df.show(10)
-
-# %% [markdown]
-# ## 5. Statistics
-
-# %%
-stats_sql = f"""
-WITH model_predictions AS (
-    SELECT 
-        p.customer_id,
-        p.predicted_uni_box_week
-    FROM BD_AA_DEV.SC_STORAGE_BMX_PS.INFERENCE_INPUT_TEMP i,
-        TABLE(
-            BD_AA_DEV.SC_MODELS_BMX.UNI_BOX_REGRESSION_PARTITIONED!PREDICT(
-                i.{customer_id_col},
-                i.{partition_col_actual},
-                i.{week_col},
-                i.{brand_col},
-                {feature_list}
-            ) OVER (PARTITION BY i.{partition_col_actual})
-        ) p
+        i.SUM_PAST_12_WEEKS::FLOAT       AS SUM_PAST_12_WEEKS,
+        i.AVG_PAST_12_WEEKS::FLOAT       AS AVG_PAST_12_WEEKS,
+        i.MAX_PAST_24_WEEKS::FLOAT       AS MAX_PAST_24_WEEKS,
+        i.SUM_PAST_24_WEEKS::FLOAT       AS SUM_PAST_24_WEEKS,
+        i.WEEK_OF_YEAR::NUMBER           AS WEEK_OF_YEAR,
+        i.AVG_AVG_DAILY_ALL_HOURS::FLOAT AS AVG_AVG_DAILY_ALL_HOURS,
+        i.SUM_P4W::FLOAT                 AS SUM_P4W,
+        i.AVG_PAST_24_WEEKS::FLOAT       AS AVG_PAST_24_WEEKS,
+        i.PHARM_SUPER_CONV::NUMBER       AS PHARM_SUPER_CONV,
+        i.WINES_LIQUOR::NUMBER           AS WINES_LIQUOR,
+        i.GROCERIES::NUMBER              AS GROCERIES,
+        i.MAX_PREV2::FLOAT               AS MAX_PREV2,
+        i.AVG_PREV2::FLOAT               AS AVG_PREV2,
+        i.MAX_PREV3::FLOAT               AS MAX_PREV3,
+        i.AVG_PREV3::FLOAT               AS AVG_PREV3,
+        i.W_M1_TOTAL::FLOAT              AS W_M1_TOTAL,
+        i.W_M2_TOTAL::FLOAT              AS W_M2_TOTAL,
+        i.W_M3_TOTAL::FLOAT              AS W_M3_TOTAL,
+        i.W_M4_TOTAL::FLOAT              AS W_M4_TOTAL,
+        i.SPEC_FOODS::NUMBER             AS SPEC_FOODS,
+        i.NUM_COOLERS::FLOAT             AS NUM_COOLERS,
+        i.NUM_DOORS::NUMBER              AS NUM_DOORS,
+        i.MAX_PAST_4_WEEKS::FLOAT        AS MAX_PAST_4_WEEKS,
+        i.SUM_PAST_4_WEEKS::FLOAT        AS SUM_PAST_4_WEEKS,
+        i.AVG_PAST_4_WEEKS::FLOAT        AS AVG_PAST_4_WEEKS,
+        i.MAX_PAST_12_WEEKS::FLOAT       AS MAX_PAST_12_WEEKS
+    FROM {FROM_SQL}
 )
 SELECT
-    COUNT(*) AS TOTAL_PREDICTIONS,
-    COUNT(DISTINCT customer_id) AS UNIQUE_CUSTOMERS,
-    ROUND(MIN(predicted_uni_box_week), 2) AS MIN_PREDICTION,
-    ROUND(MAX(predicted_uni_box_week), 2) AS MAX_PREDICTION,
-    ROUND(AVG(predicted_uni_box_week), 2) AS AVG_PREDICTION,
-    ROUND(STDDEV(predicted_uni_box_week), 2) AS STDDEV_PREDICTION,
-    ROUND(PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY predicted_uni_box_week), 2) AS Q1,
-    ROUND(PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY predicted_uni_box_week), 2) AS MEDIAN,
-    ROUND(PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY predicted_uni_box_week), 2) AS Q3
-FROM model_predictions
+    p.CUSTOMER_ID,
+    p.STATS_NTILE_GROUP,
+    p.WEEK,
+    p.BRAND_PRES_RET,
+    p.predicted_uni_box_week
+FROM typed_input t,
+TABLE(
+  MODEL({MODEL_FQN}, PRODUCTION)!PREDICT(
+    t.CUSTOMER_ID,
+    t.STATS_NTILE_GROUP,
+    t.WEEK,
+    t.BRAND_PRES_RET,
+    t.SUM_PAST_12_WEEKS,
+    t.AVG_PAST_12_WEEKS,
+    t.MAX_PAST_24_WEEKS,
+    t.SUM_PAST_24_WEEKS,
+    t.WEEK_OF_YEAR,
+    t.AVG_AVG_DAILY_ALL_HOURS,
+    t.SUM_P4W,
+    t.AVG_PAST_24_WEEKS,
+    t.PHARM_SUPER_CONV,
+    t.WINES_LIQUOR,
+    t.GROCERIES,
+    t.MAX_PREV2,
+    t.AVG_PREV2,
+    t.MAX_PREV3,
+    t.AVG_PREV3,
+    t.W_M1_TOTAL,
+    t.W_M2_TOTAL,
+    t.W_M3_TOTAL,
+    t.W_M4_TOTAL,
+    t.SPEC_FOODS,
+    t.NUM_COOLERS,
+    t.NUM_DOORS,
+    t.MAX_PAST_4_WEEKS,
+    t.SUM_PAST_4_WEEKS,
+    t.AVG_PAST_4_WEEKS,
+    t.MAX_PAST_12_WEEKS
+  ) OVER (PARTITION BY t.STATS_NTILE_GROUP)
+) p
 """
 
-session.sql(stats_sql).show()
-
-# %% [markdown]
-# ## 6. Save to INFERENCE_LOGS
-
 # %%
-session.sql("""
-    CREATE TABLE IF NOT EXISTS BD_AA_DEV.SC_STORAGE_BMX_PS.INFERENCE_LOGS (
-        customer_id VARCHAR,
-        week VARCHAR,
-        brand_pres_ret VARCHAR,
-        stats_ntile_group VARCHAR,
-        predicted_uni_box_week FLOAT,
-        inference_timestamp TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
-        model_version VARCHAR
-    )
-""").collect()
-insert_sql = f"""
-INSERT INTO BD_AA_DEV.SC_STORAGE_BMX_PS.INFERENCE_LOGS
-    (customer_id, week, brand_pres_ret, stats_ntile_group, predicted_uni_box_week, model_version)
-WITH model_predictions AS (
-    SELECT 
-        p.customer_id,
-        p.{partition_col_actual},
-        p.predicted_uni_box_week
-    FROM BD_AA_DEV.SC_STORAGE_BMX_PS.INFERENCE_INPUT_TEMP i,
-        TABLE(
-            BD_AA_DEV.SC_MODELS_BMX.UNI_BOX_REGRESSION_PARTITIONED!PREDICT(
-                i.{customer_id_col},
-                i.{partition_col_actual},
-                {feature_list}
-            ) OVER (PARTITION BY i.{partition_col_actual})
-        ) p
-)
-SELECT 
-    mp.customer_id,
-    i.{week_col},
-    i.{brand_col},
-    mp.{partition_col_actual},
-    mp.predicted_uni_box_week,
-    '{model_version.version_name}'
-FROM model_predictions mp
-JOIN BD_AA_DEV.SC_STORAGE_BMX_PS.INFERENCE_INPUT_TEMP i 
-    ON mp.customer_id = i.{customer_id_col}
-    AND mp.{partition_col_actual} = i.{partition_col_actual}
-"""
+df = session.sql(inference_sql)
+count = df.count()
+elapsed = time.time() - start_time
 
-session.sql(insert_sql).collect()
-log_count = session.sql("SELECT COUNT(*) as CNT FROM BD_AA_DEV.SC_STORAGE_BMX_PS.INFERENCE_LOGS").collect()[0]['CNT']
-print(f"✅ Saved {log_count:,} to INFERENCE_LOGS")
-session.sql("SELECT * FROM BD_AA_DEV.SC_STORAGE_BMX_PS.INFERENCE_LOGS ORDER BY inference_timestamp DESC LIMIT 5").show()
-
-# %% [markdown]
-# ## 7. Summary
-
-# %%
-print(f"\n🎉 Done — {prediction_count:,} predictions, {inference_time:.2f}s, model {model_version.version_name}")
+print(f"✅ {count:,} predictions in {elapsed:.2f}s")
+df.show(10)
