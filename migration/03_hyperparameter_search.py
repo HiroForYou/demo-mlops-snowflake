@@ -209,13 +209,13 @@ for param, dist in SEARCH_SPACES["XGBRegressor"].items():
             print(f"   {param}: uniform({dist.low:.2f}, {dist.high:.2f})")
 
 # Number of trials for Random Search
-num_trials = 10
+num_trials = 15
 max_concurrent_trials = 4
 print(f"\n🔢 Random Search trials per group: {num_trials}")
 print(f"   Max concurrent trials per group: {max_concurrent_trials}")
 
 # Sample rate per group for hyperparameter search
-SAMPLE_RATE_PER_GROUP = 0.1
+SAMPLE_RATE_PER_GROUP = 0.2
 print(f"📊 Sample rate per group: {SAMPLE_RATE_PER_GROUP*100:.0f}%")
 if SAMPLE_RATE_PER_GROUP < 1.0:
     print(
@@ -251,14 +251,14 @@ print("=" * 80)
 try:
     from snowflake.ml.runtime_cluster import scale_cluster
 
-    print("⏳ Escalando cluster a 4 contenedores...")
+    print("⏳ Escalando cluster a 5 contenedores...")
     scale_cluster(
-        expected_cluster_size=4,
+        expected_cluster_size=5,
         options={
             "block_until_min_cluster_size": 2  # Return when at least 2 nodes ready
         }
     )
-    print("✅ Cluster escalado a 4 contenedores")
+    print("✅ Cluster escalado a 5 contenedores")
 except Exception as e:
     print(f"⚠️  Error al escalar cluster: {str(e)[:200]}")
     print("   Continuando con el cluster actual...")
@@ -331,6 +331,10 @@ excluded_cols = [
 ]
 
 
+# %% [markdown]
+# ### 4b. Funciones helper: target y features numéricas
+
+# %%
 def _get_target_column(df):
     """Return the target column name in df (case-insensitive match for uni_box_week)."""
     for c in df.columns:
@@ -364,7 +368,7 @@ for col in sorted(feature_cols):
 all_results = {}
 
 # %% [markdown]
-# ### 4b. Definiciones: función de entrenamiento para el Tuner y HPO por grupo
+# ### 4c. Función de entrenamiento para el Tuner
 
 # %%
 def create_train_func_for_tuner(feature_cols, model_type, target_col):
@@ -472,6 +476,10 @@ def create_train_func_for_tuner(feature_cols, model_type, target_col):
     return train_func
 
 
+# %% [markdown]
+# ### 4d. Búsqueda de hiperparámetros para un grupo
+
+# %%
 def run_hyperparameter_search_for_one_group(group_name, group_df):
     """
     Run hyperparameter search for one group (HPO only, no MMT).

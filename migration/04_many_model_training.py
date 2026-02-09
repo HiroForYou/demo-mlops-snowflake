@@ -21,7 +21,7 @@ print(f"✅ {session.get_current_database()}.{session.get_current_schema()}")
 
 USE_CLEANED_TABLES = False
 FEATURES_TABLE = "BD_AA_DEV.SC_FEATURES_BMX.UNI_BOX_FEATURES"
-MMT_SAMPLE_FRACTION = 0.01  # None = 100%
+MMT_SAMPLE_FRACTION = None  # None = 100%
 
 GROUP_MODEL = {
     "group_stat_0_1": "LGBMRegressor",
@@ -438,7 +438,7 @@ print("\n📊 Filas por grupo:")
 group_counts = (
     training_df.group_by(PARTITION_COL).count().sort(PARTITION_COL)
 )
-group_counts.show()
+group_counts.show(n=20)
 
 if MMT_SAMPLE_FRACTION is not None and 0 < MMT_SAMPLE_FRACTION < 1:
     n_before = training_df.count()
@@ -651,8 +651,8 @@ def train_segment_model(data_connector, context):
 # %%
 try:
     from snowflake.ml.runtime_cluster import scale_cluster
-    scale_cluster(expected_cluster_size=4, options={"block_until_min_cluster_size": 2})
-    print("✅ Cluster 4 nodos")
+    scale_cluster(expected_cluster_size=5, options={"block_until_min_cluster_size": 2})
+    print("✅ Cluster 5 nodos")
 except Exception as e:
     print(f"⚠️ scale_cluster: {str(e)[:150]}")
 
