@@ -139,6 +139,7 @@ scripts = [
     '01_data_validation_and_cleaning.py',
     '02_feature_store_setup.py',
     '03_hyperparameter_search.py',
+    '03b_hyperparameter_search_bayesian.py',
     '04_many_model_training.py',
     '05_create_partitioned_model.py',
     '06_partitioned_inference_batch.py'

@@ -1,14 +1,14 @@
 # %% [markdown]
-# # Migration: Hyperparameter Search (LGBM/XGB + Snowflake ML Tune) - Per Group
+# # Migration: Hyperparameter Search (LGBM/XGB + Snowflake ML Tune) - Per Group - Bayesian Search
 #
 # ## Overview
 # This script performs hyperparameter optimization using Snowflake ML's tune.search for regression (LGBM, XGBoost per group).
-# **Runs HPO per group in a sequential loop (no MMT) to avoid Ray serialization issues; each group runs its own Random Search.**
+# **Runs HPO per group in a sequential loop (no MMT) to avoid Ray serialization issues; each group runs its own Bayesian Search.**
 #
 # ## What We'll Do:
 # 1. Load cleaned training data with stats_ntile_group
 # 2. Get all 16 unique groups
-# 3. For each group (loop): load group data, run Random Search with snowflake.ml.modeling.tune, save best hyperparameters to SC_MODELS_BMX.HYPERPARAMETER_RESULTS
+# 3. For each group (loop): load group data, run Bayesian Search with snowflake.ml.modeling.tune, save best hyperparameters to SC_MODELS_BMX.HYPERPARAMETER_RESULTS
 # 4. Generate summary of all hyperparameter results
 
 # %%
@@ -18,10 +18,9 @@ from snowflake.ml.modeling.tune import (
     Tuner,
     TunerConfig,
     get_tuner_context,
-    randint,
     uniform,
 )
-from snowflake.ml.modeling.tune.search import RandomSearch
+from snowflake.ml.modeling.tune.search import BayesOpt
 from snowflake.ml.data.data_connector import DataConnector
 from snowflake.ml.experiment import ExperimentTracking
 import numpy as np
@@ -75,7 +74,7 @@ print(f"   Schema: {session.get_current_schema()}")
 
 # Configuration:
 # - If you don't have permissions for FeatureView/Dynamic Tables, use cleaned tables.
-# - Flag is kept with automatic fallback if Feature Store mode fails.
+# - Keep the flag but add automatic fallback if Feature Store mode fails.
 USE_CLEANED_TABLES = (
     False  # True = TRAIN_DATASET_CLEANED, False = try Feature Store
 )
@@ -199,45 +198,47 @@ print("\n" + "=" * 80)
 print("🎯 DEFINING HYPERPARAMETER SEARCH SPACE")
 print("=" * 80)
 
-# Search spaces per model type (LGBM, XGBoost)
+# Search spaces per model type (LGBM, XGBoost).
+# BayesOpt requires continuous search spaces and only uniform() sampling (see Snowflake docs:
+# https://docs.snowflake.com/en/developer-guide/snowflake-ml/container-hpo).
+# Integer params use uniform(low, high) and are cast to int inside the training function.
 SEARCH_SPACES = {
     "XGBRegressor": {
-        "n_estimators": randint(50, 300),
-        "max_depth": randint(3, 10),
+        "n_estimators": uniform(50, 300),
+        "max_depth": uniform(3, 10),
         "learning_rate": uniform(0.01, 0.3),
         "subsample": uniform(0.6, 1.0),
         "colsample_bytree": uniform(0.6, 1.0),
-        "min_child_weight": randint(1, 7),
+        "min_child_weight": uniform(1, 7),
         "gamma": uniform(0, 0.5),
         "reg_alpha": uniform(0, 1),
         "reg_lambda": uniform(0, 1),
     },
     "LGBMRegressor": {
-        "n_estimators": randint(50, 300),
-        "max_depth": randint(3, 10),
+        "n_estimators": uniform(50, 300),
+        "max_depth": uniform(3, 10),
         "learning_rate": uniform(0.01, 0.3),
-        "num_leaves": randint(20, 150),
+        "num_leaves": uniform(20, 150),
         "subsample": uniform(0.6, 1.0),
         "colsample_bytree": uniform(0.6, 1.0),
         "reg_alpha": uniform(0, 1),
         "reg_lambda": uniform(0, 1),
-        "min_child_samples": randint(5, 50),
+        "min_child_samples": uniform(5, 50),
     },
 }
+
+# Parameters that must be integers (sampled with uniform() for BayesOpt, cast in train_func)
+INT_PARAMS = {"n_estimators", "max_depth", "min_child_weight", "num_leaves", "min_child_samples"}
 
 print("\n📋 Hyperparameter Search Spaces (per model type):")
 for model_type, search_space in SEARCH_SPACES.items():
     print(f"   {model_type}: {list(search_space.keys())}")
-print("\n📋 XGBRegressor search space (example):")
+print("\n📋 XGBRegressor search space (BayesOpt: uniform only, int params cast in train_func):")
 for param, dist in SEARCH_SPACES["XGBRegressor"].items():
     if hasattr(dist, "low") and hasattr(dist, "high"):
-        dist_name = dist.__class__.__name__.lower()
-        if "rand" in dist_name and "int" in dist_name:
-            print(f"   {param}: randint({dist.low}, {dist.high})")
-        else:
-            print(f"   {param}: uniform({dist.low:.2f}, {dist.high:.2f})")
+        print(f"   {param}: uniform({dist.low}, {dist.high})")
 
-print(f"\n🔢 Random Search trials per group: {NUM_TRIALS}")
+print(f"\n🔢 Bayesian Search trials per group: {NUM_TRIALS}")
 print(f"   Max concurrent trials per group: {MAX_CONCURRENT_TRIALS}")
 print(f"📊 Sample rate per group: {SAMPLE_RATE_PER_GROUP*100:.0f}%")
 if SAMPLE_RATE_PER_GROUP < 1.0:
@@ -251,7 +252,7 @@ else:
 # ### 3c. (Optional) View Ray Dashboard
 #
 # Use this cell in Snowflake Notebooks to get the Ray Dashboard URL
-# associated with the current runtime. Copy and paste the URL in your browser.
+# for the current runtime. Copy and paste the URL in your browser.
 
 # %%
 try:
@@ -419,6 +420,10 @@ def create_train_func_for_tuner(feature_cols, model_type, target_col):
         y_val = test_pd[target_col].fillna(0).values
 
         model_params = params.copy()
+        # BayesOpt uses only uniform(); cast integer hyperparameters (see Snowflake HPO docs)
+        for k in INT_PARAMS:
+            if k in model_params and model_params[k] is not None:
+                model_params[k] = int(round(float(model_params[k])))
         model_params["random_state"] = 42
 
         if model_type == "XGBRegressor":
@@ -618,13 +623,13 @@ def run_hyperparameter_search_for_one_group(group_name, group_snowpark_df):
     tuner_config = TunerConfig(
         metric="rmse",
         mode="min",
-        search_alg=RandomSearch(),
+        search_alg=BayesOpt(utility_kwargs={"kind": "ucb", "kappa": 2.5, "xi": 0.0}),
         num_trials=NUM_TRIALS,
         max_concurrent_trials=MAX_CONCURRENT_TRIALS,
     )
 
     # Create and run Tuner
-    print(f"   ⏳ Starting Random Search ({model_type}, {NUM_TRIALS} trials)...")
+    print(f"   ⏳ Starting Bayesian Search ({model_type}, {NUM_TRIALS} trials)...")
     start_time = time.time()
 
     try:
@@ -827,7 +832,7 @@ def run_hyperparameter_search_for_one_group(group_name, group_snowpark_df):
 print("\n" + "=" * 80)
 print("🚀 HYPERPARAMETER SEARCH PER GROUP (sequential loop)")
 print("=" * 80)
-print("\nRunning Random Search with Tuner for each group (no MMT).\n")
+print("\nRunning Bayesian Search with Tuner for each group (no MMT).\n")
 
 start_time = time.time()
 group_results = {}
@@ -943,14 +948,14 @@ print("=" * 80)
 try:
     from snowflake.ml.runtime_cluster import scale_cluster
 
-    print("⏳ Reduciendo cluster a 1 contenedor...")
+    print(f"⏳ Scaling cluster down to {CLUSTER_SIZE_DOWN} container...")
     scale_cluster(
-        expected_cluster_size=1
+        expected_cluster_size=CLUSTER_SIZE_DOWN
     )
-    print("✅ Cluster reducido a 1 contenedor")
+    print(f"✅ Cluster scaled down to {CLUSTER_SIZE_DOWN} container")
 except Exception as e:
-    print(f"⚠️  Error al reducir cluster: {str(e)[:200]}")
-    print("   Cluster may still be scaling...")
+    print(f"⚠️  Error scaling cluster down: {str(e)[:200]}")
+    print("   Cluster may remain scaled...")
 
 # %% [markdown]
 # ## 8. Summary
@@ -963,7 +968,7 @@ print("=" * 80)
 print("\n📋 Summary:")
 print(f"   ✅ Models: LGBMRegressor, XGBRegressor, SGDRegressor (per group)")
 print(
-    f"   ✅ Search method: Snowflake ML tune.search RandomSearch (per-group loop, no MMT)"
+    f"   ✅ Search method: Snowflake ML tune.search BayesOpt (per-group loop, no MMT)"
 )
 print(f"   ✅ Execution: Sequential loop over groups (avoids Ray serialization)")
 print(f"   ✅ Groups processed: {successful_searches}/{len(groups_list)}")

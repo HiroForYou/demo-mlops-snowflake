@@ -15,9 +15,33 @@ from snowflake.snowpark.context import get_active_session
 
 session = get_active_session()
 
+# Configuration: Database, schemas, and tables
+DATABASE = "BD_AA_DEV"
+STORAGE_SCHEMA = "SC_STORAGE_BMX_PS"
+TRAIN_TABLE_STRUCTURED = f"{DATABASE}.{STORAGE_SCHEMA}.TRAIN_DATASET_STRUCTURED"
+INFERENCE_TABLE_STRUCTURED = f"{DATABASE}.{STORAGE_SCHEMA}.INFERENCE_DATASET_STRUCTURED"
+TRAIN_TABLE_CLEANED = f"{DATABASE}.{STORAGE_SCHEMA}.TRAIN_DATASET_CLEANED"
+INFERENCE_TABLE_CLEANED = f"{DATABASE}.{STORAGE_SCHEMA}.INFERENCE_DATASET_CLEANED"
+
+# Column constants
+TARGET_COLUMN = "UNI_BOX_WEEK"
+STATS_NTILE_GROUP_COL = "STATS_NTILE_GROUP"
+
+# Excluded columns (metadata columns, not features) - defined once at the beginning
+EXCLUDED_COLS = [
+    "CUSTOMER_ID",
+    "BRAND_PRES_RET",
+    "WEEK",
+    "GROUP",
+    "STATS_GROUP",
+    "PERCENTILE_GROUP",
+    STATS_NTILE_GROUP_COL,
+    "PROD_KEY",
+]
+
 # Set context
-session.sql("USE DATABASE BD_AA_DEV").collect()
-session.sql("USE SCHEMA SC_STORAGE_BMX_PS").collect()
+session.sql(f"USE DATABASE {DATABASE}").collect()
+session.sql(f"USE SCHEMA {STORAGE_SCHEMA}").collect()
 
 print(f"✅ Connected to Snowflake")
 print(f"   Database: {session.get_current_database()}")
@@ -33,7 +57,7 @@ print("=" * 80)
 
 # Check if table exists
 try:
-    train_df = session.table("BD_AA_DEV.SC_STORAGE_BMX_PS.TRAIN_DATASET_STRUCTURED")
+    train_df = session.table(TRAIN_TABLE_STRUCTURED)
     total_rows = train_df.count()
     print(f"\n✅ Table exists: TRAIN_DATASET_STRUCTURED")
     print(f"   Total rows: {total_rows:,}")
@@ -48,18 +72,15 @@ for col in columns:
     print(f"   - {col}")
 
 # Check for target variable (case-insensitive)
-columns_lower = [col.lower() for col in columns]
-if "uni_box_week" in columns_lower:
+columns_upper = [col.upper() for col in columns]
+if TARGET_COLUMN in columns_upper:
     # Find the actual column name (preserving case)
-    target_col = columns[columns_lower.index("uni_box_week")]
-    print(f"\n✅ Target variable 'uni_box_week' found (as '{target_col}')")
+    target_col = columns[columns_upper.index(TARGET_COLUMN)]
+    print(f"\n✅ Target variable '{TARGET_COLUMN}' found (as '{target_col}')")
 else:
-    print(f"\n❌ Target variable 'uni_box_week' NOT found!")
+    print(f"\n❌ Target variable '{TARGET_COLUMN}' NOT found!")
     print(f"   Available columns: {', '.join(columns)}")
-    raise ValueError("Target variable 'uni_box_week' is required")
-
-# Store target column name for later use
-TARGET_COLUMN = target_col
+    raise ValueError(f"Target variable '{TARGET_COLUMN}' is required")
 
 # %% [markdown]
 # ## 2. Validate Inference Dataset
@@ -70,9 +91,7 @@ print("📊 VALIDATING INFERENCE DATASET")
 print("=" * 80)
 
 try:
-    inference_df = session.table(
-        "BD_AA_DEV.SC_STORAGE_BMX_PS.INFERENCE_DATASET_STRUCTURED"
-    )
+    inference_df = session.table(INFERENCE_TABLE_STRUCTURED)
     inference_rows = inference_df.count()
     print(f"\n✅ Table exists: INFERENCE_DATASET_STRUCTURED")
     print(f"   Total rows: {inference_rows:,}")
@@ -82,9 +101,9 @@ except Exception as e:
 
 # Verify target is NOT in inference
 inference_columns = inference_df.columns
-inference_columns_lower = [col.lower() for col in inference_columns]
-if "uni_box_week" in inference_columns_lower:
-    print(f"\n⚠️  WARNING: Target variable 'uni_box_week' found in inference dataset")
+inference_columns_upper = [col.upper() for col in inference_columns]
+if TARGET_COLUMN in inference_columns_upper:
+    print(f"\n⚠️  WARNING: Target variable '{TARGET_COLUMN}' found in inference dataset")
     print(f"   This is expected - inference should not have target values")
 else:
     print(f"\n✅ Target variable correctly absent from inference dataset")
@@ -99,13 +118,13 @@ print("=" * 80)
 
 # Check NULLs in training data
 null_check_train = session.sql(
-    """
+    f"""
     SELECT
         COUNT(*) AS TOTAL_ROWS,
-        SUM(CASE WHEN uni_box_week IS NULL THEN 1 ELSE 0 END) AS NULL_TARGET,
-        SUM(CASE WHEN customer_id IS NULL THEN 1 ELSE 0 END) AS NULL_CUSTOMER_ID,
-        SUM(CASE WHEN week IS NULL THEN 1 ELSE 0 END) AS NULL_WEEK
-    FROM BD_AA_DEV.SC_STORAGE_BMX_PS.TRAIN_DATASET_STRUCTURED
+        SUM(CASE WHEN {TARGET_COLUMN} IS NULL THEN 1 ELSE 0 END) AS NULL_TARGET,
+        SUM(CASE WHEN CUSTOMER_ID IS NULL THEN 1 ELSE 0 END) AS NULL_CUSTOMER_ID,
+        SUM(CASE WHEN WEEK IS NULL THEN 1 ELSE 0 END) AS NULL_WEEK
+    FROM {TRAIN_TABLE_STRUCTURED}
 """
 )
 
@@ -114,13 +133,13 @@ null_check_train.show()
 
 # Check for NULLs in key features
 feature_null_check = session.sql(
-    """
+    f"""
     SELECT
-        SUM(CASE WHEN sum_past_12_weeks IS NULL THEN 1 ELSE 0 END) AS NULL_sum_past_12_weeks,
-        SUM(CASE WHEN avg_past_12_weeks IS NULL THEN 1 ELSE 0 END) AS NULL_avg_past_12_weeks,
-        SUM(CASE WHEN week_of_year IS NULL THEN 1 ELSE 0 END) AS NULL_week_of_year,
-        SUM(CASE WHEN stats_ntile_group IS NULL THEN 1 ELSE 0 END) AS NULL_stats_ntile_group
-    FROM BD_AA_DEV.SC_STORAGE_BMX_PS.TRAIN_DATASET_STRUCTURED
+        SUM(CASE WHEN SUM_PAST_12_WEEKS IS NULL THEN 1 ELSE 0 END) AS NULL_SUM_PAST_12_WEEKS,
+        SUM(CASE WHEN AVG_PAST_12_WEEKS IS NULL THEN 1 ELSE 0 END) AS NULL_AVG_PAST_12_WEEKS,
+        SUM(CASE WHEN WEEK_OF_YEAR IS NULL THEN 1 ELSE 0 END) AS NULL_WEEK_OF_YEAR,
+        SUM(CASE WHEN STATS_NTILE_GROUP IS NULL THEN 1 ELSE 0 END) AS NULL_STATS_NTILE_GROUP
+    FROM {TRAIN_TABLE_STRUCTURED}
 """
 )
 
@@ -136,19 +155,19 @@ print("📈 TARGET VARIABLE DISTRIBUTION")
 print("=" * 80)
 
 target_stats = session.sql(
-    """
+    f"""
     SELECT
         COUNT(*) AS TOTAL_RECORDS,
-        COUNT(DISTINCT uni_box_week) AS UNIQUE_VALUES,
-        MIN(uni_box_week) AS MIN_VALUE,
-        MAX(uni_box_week) AS MAX_VALUE,
-        AVG(uni_box_week) AS MEAN_VALUE,
-        STDDEV(uni_box_week) AS STDDEV_VALUE,
-        PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY uni_box_week) AS Q1,
-        PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY uni_box_week) AS MEDIAN,
-        PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY uni_box_week) AS Q3
-    FROM BD_AA_DEV.SC_STORAGE_BMX_PS.TRAIN_DATASET_STRUCTURED
-    WHERE uni_box_week IS NOT NULL
+        COUNT(DISTINCT {TARGET_COLUMN}) AS UNIQUE_VALUES,
+        MIN({TARGET_COLUMN}) AS MIN_VALUE,
+        MAX({TARGET_COLUMN}) AS MAX_VALUE,
+        AVG({TARGET_COLUMN}) AS MEAN_VALUE,
+        STDDEV({TARGET_COLUMN}) AS STDDEV_VALUE,
+        PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY {TARGET_COLUMN}) AS Q1,
+        PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY {TARGET_COLUMN}) AS MEDIAN,
+        PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY {TARGET_COLUMN}) AS Q3
+    FROM {TRAIN_TABLE_STRUCTURED}
+    WHERE {TARGET_COLUMN} IS NOT NULL
 """
 )
 
@@ -157,22 +176,22 @@ target_stats.show()
 
 # Check for outliers (values beyond 3 standard deviations)
 outlier_check = session.sql(
-    """
+    f"""
     WITH stats AS (
         SELECT
-            AVG(uni_box_week) AS mean_val,
-            STDDEV(uni_box_week) AS stddev_val
-        FROM BD_AA_DEV.SC_STORAGE_BMX_PS.TRAIN_DATASET_STRUCTURED
-        WHERE uni_box_week IS NOT NULL
+            AVG({TARGET_COLUMN}) AS mean_val,
+            STDDEV({TARGET_COLUMN}) AS stddev_val
+        FROM {TRAIN_TABLE_STRUCTURED}
+        WHERE {TARGET_COLUMN} IS NOT NULL
     )
     SELECT
         COUNT(*) AS OUTLIER_COUNT,
-        MIN(uni_box_week) AS MIN_OUTLIER,
-        MAX(uni_box_week) AS MAX_OUTLIER
-    FROM BD_AA_DEV.SC_STORAGE_BMX_PS.TRAIN_DATASET_STRUCTURED, stats
-    WHERE uni_box_week IS NOT NULL
-        AND (uni_box_week < mean_val - 3 * stddev_val 
-             OR uni_box_week > mean_val + 3 * stddev_val)
+        MIN({TARGET_COLUMN}) AS MIN_OUTLIER,
+        MAX({TARGET_COLUMN}) AS MAX_OUTLIER
+    FROM {TRAIN_TABLE_STRUCTURED}, stats
+    WHERE {TARGET_COLUMN} IS NOT NULL
+        AND ({TARGET_COLUMN} < mean_val - 3 * stddev_val 
+             OR {TARGET_COLUMN} > mean_val + 3 * stddev_val)
 """
 )
 
@@ -187,24 +206,19 @@ print("\n" + "=" * 80)
 print("🔗 FEATURE COMPATIBILITY CHECK")
 print("=" * 80)
 
-# Define excluded columns
-excluded_cols = [
-    "customer_id",
-    "brand_pres_ret",
-    "week",
-    "group",
-    "stats_group",
-    "percentile_group",
-    "stats_ntile_group",
-]
-
 # Get feature columns from training (exclude target + excluded)
+# EXCLUDED_COLS is already in UPPER CASE, so we compare case-insensitively
+excluded_cols_upper = {col for col in EXCLUDED_COLS}
 train_feature_cols = [
-    col for col in columns if col not in excluded_cols and col != TARGET_COLUMN
+    col for col in columns 
+    if col.upper() not in excluded_cols_upper and col.upper() != TARGET_COLUMN
 ]
 
 # Get feature columns from inference (exclude excluded)
-inference_feature_cols = [col for col in inference_columns if col not in excluded_cols]
+inference_feature_cols = [
+    col for col in inference_columns 
+    if col.upper() not in excluded_cols_upper
+]
 
 print(f"\n📋 Training Features ({len(train_feature_cols)}):")
 for col in sorted(train_feature_cols):
@@ -242,45 +256,40 @@ print("=" * 80)
 # Create cleaned training table
 print("\n📝 Creating cleaned training table...")
 
-cleaned_train_sql = """
-CREATE OR REPLACE TABLE BD_AA_DEV.SC_STORAGE_BMX_PS.TRAIN_DATASET_CLEANED AS
+cleaned_train_sql = f"""
+CREATE OR REPLACE TABLE {TRAIN_TABLE_CLEANED} AS
 SELECT *
-FROM BD_AA_DEV.SC_STORAGE_BMX_PS.TRAIN_DATASET_STRUCTURED
-WHERE uni_box_week IS NOT NULL
-    AND customer_id IS NOT NULL
-    AND week IS NOT NULL
-    -- Remove extreme outliers (optional - adjust threshold as needed)
-    AND uni_box_week >= 0
-    AND uni_box_week <= (
-        SELECT PERCENTILE_CONT(0.99) WITHIN GROUP (ORDER BY uni_box_week)
-        FROM BD_AA_DEV.SC_STORAGE_BMX_PS.TRAIN_DATASET_STRUCTURED
-        WHERE uni_box_week IS NOT NULL
+FROM {TRAIN_TABLE_STRUCTURED}
+WHERE {TARGET_COLUMN} IS NOT NULL
+    AND CUSTOMER_ID IS NOT NULL
+    AND WEEK IS NOT NULL
+    AND {TARGET_COLUMN} >= 0
+    AND {TARGET_COLUMN} <= (
+        SELECT PERCENTILE_CONT(0.99) WITHIN GROUP (ORDER BY {TARGET_COLUMN})
+        FROM {TRAIN_TABLE_STRUCTURED}
+        WHERE {TARGET_COLUMN} IS NOT NULL
     )
 """
 
 session.sql(cleaned_train_sql).collect()
 
-cleaned_train_count = session.table(
-    "BD_AA_DEV.SC_STORAGE_BMX_PS.TRAIN_DATASET_CLEANED"
-).count()
+cleaned_train_count = session.table(TRAIN_TABLE_CLEANED).count()
 print(f"✅ Cleaned training table created: {cleaned_train_count:,} rows")
 
 # Create cleaned inference table
 print("\n📝 Creating cleaned inference table...")
 
-cleaned_inference_sql = """
-CREATE OR REPLACE TABLE BD_AA_DEV.SC_STORAGE_BMX_PS.INFERENCE_DATASET_CLEANED AS
+cleaned_inference_sql = f"""
+CREATE OR REPLACE TABLE {INFERENCE_TABLE_CLEANED} AS
 SELECT *
-FROM BD_AA_DEV.SC_STORAGE_BMX_PS.INFERENCE_DATASET_STRUCTURED
-WHERE customer_id IS NOT NULL
-    AND week IS NOT NULL
+FROM {INFERENCE_TABLE_STRUCTURED}
+WHERE CUSTOMER_ID IS NOT NULL
+    AND WEEK IS NOT NULL
 """
 
 session.sql(cleaned_inference_sql).collect()
 
-cleaned_inference_count = session.table(
-    "BD_AA_DEV.SC_STORAGE_BMX_PS.INFERENCE_DATASET_CLEANED"
-).count()
+cleaned_inference_count = session.table(INFERENCE_TABLE_CLEANED).count()
 print(f"✅ Cleaned inference table created: {cleaned_inference_count:,} rows")
 
 # %% [markdown]
@@ -291,14 +300,14 @@ print("\n" + "=" * 80)
 print("🔍 VALIDATING stats_ntile_group SEGMENTATION")
 print("=" * 80)
 
-# Check if stats_ntile_group exists
-if "stats_ntile_group" not in columns_lower:
-    print("\n❌ ERROR: Column 'stats_ntile_group' NOT found in training dataset!")
+# Check if STATS_NTILE_GROUP exists
+if STATS_NTILE_GROUP_COL not in columns_upper:
+    print(f"\n❌ ERROR: Column '{STATS_NTILE_GROUP_COL}' NOT found in training dataset!")
     print("   This column is required for 16-group model training.")
-    raise ValueError("stats_ntile_group column is required")
+    raise ValueError(f"{STATS_NTILE_GROUP_COL} column is required")
 
 # Find actual column name (preserving case)
-stats_ntile_col = columns[columns_lower.index("stats_ntile_group")]
+stats_ntile_col = columns[columns_upper.index(STATS_NTILE_GROUP_COL)]
 
 # Get unique groups
 groups_df = session.sql(
@@ -306,11 +315,11 @@ groups_df = session.sql(
     SELECT 
         {stats_ntile_col} AS GROUP_NAME,
         COUNT(*) AS RECORD_COUNT,
-        COUNT(DISTINCT customer_id) AS UNIQUE_CUSTOMERS,
-        AVG(uni_box_week) AS AVG_TARGET,
-        MIN(uni_box_week) AS MIN_TARGET,
-        MAX(uni_box_week) AS MAX_TARGET
-    FROM BD_AA_DEV.SC_STORAGE_BMX_PS.TRAIN_DATASET_CLEANED
+        COUNT(DISTINCT CUSTOMER_ID) AS UNIQUE_CUSTOMERS,
+        AVG({TARGET_COLUMN}) AS AVG_TARGET,
+        MIN({TARGET_COLUMN}) AS MIN_TARGET,
+        MAX({TARGET_COLUMN}) AS MAX_TARGET
+    FROM {TRAIN_TABLE_CLEANED}
     WHERE {stats_ntile_col} IS NOT NULL
     GROUP BY {stats_ntile_col}
     ORDER BY {stats_ntile_col}
@@ -342,7 +351,7 @@ min_records_check = session.sql(
         SELECT 
             {stats_ntile_col},
             COUNT(*) AS RECORD_COUNT
-        FROM BD_AA_DEV.SC_STORAGE_BMX_PS.TRAIN_DATASET_CLEANED
+        FROM {TRAIN_TABLE_CLEANED}
         WHERE {stats_ntile_col} IS NOT NULL
         GROUP BY {stats_ntile_col}
     )
@@ -370,34 +379,34 @@ print("📊 SUMMARY STATISTICS")
 print("=" * 80)
 
 summary = session.sql(
-    """
+    f"""
     SELECT
         'Training (Original)' AS DATASET,
         COUNT(*) AS TOTAL_ROWS,
-        COUNT(DISTINCT customer_id) AS UNIQUE_CUSTOMERS,
-        COUNT(DISTINCT week) AS UNIQUE_WEEKS
-    FROM BD_AA_DEV.SC_STORAGE_BMX_PS.TRAIN_DATASET_STRUCTURED
+        COUNT(DISTINCT CUSTOMER_ID) AS UNIQUE_CUSTOMERS,
+        COUNT(DISTINCT WEEK) AS UNIQUE_WEEKS
+    FROM {TRAIN_TABLE_STRUCTURED}
     UNION ALL
     SELECT
         'Training (Cleaned)' AS DATASET,
         COUNT(*) AS TOTAL_ROWS,
-        COUNT(DISTINCT customer_id) AS UNIQUE_CUSTOMERS,
-        COUNT(DISTINCT week) AS UNIQUE_WEEKS
-    FROM BD_AA_DEV.SC_STORAGE_BMX_PS.TRAIN_DATASET_CLEANED
+        COUNT(DISTINCT CUSTOMER_ID) AS UNIQUE_CUSTOMERS,
+        COUNT(DISTINCT WEEK) AS UNIQUE_WEEKS
+    FROM {TRAIN_TABLE_CLEANED}
     UNION ALL
     SELECT
         'Inference (Original)' AS DATASET,
         COUNT(*) AS TOTAL_ROWS,
-        COUNT(DISTINCT customer_id) AS UNIQUE_CUSTOMERS,
-        COUNT(DISTINCT week) AS UNIQUE_WEEKS
-    FROM BD_AA_DEV.SC_STORAGE_BMX_PS.INFERENCE_DATASET_STRUCTURED
+        COUNT(DISTINCT CUSTOMER_ID) AS UNIQUE_CUSTOMERS,
+        COUNT(DISTINCT WEEK) AS UNIQUE_WEEKS
+    FROM {INFERENCE_TABLE_STRUCTURED}
     UNION ALL
     SELECT
         'Inference (Cleaned)' AS DATASET,
         COUNT(*) AS TOTAL_ROWS,
-        COUNT(DISTINCT customer_id) AS UNIQUE_CUSTOMERS,
-        COUNT(DISTINCT week) AS UNIQUE_WEEKS
-    FROM BD_AA_DEV.SC_STORAGE_BMX_PS.INFERENCE_DATASET_CLEANED
+        COUNT(DISTINCT CUSTOMER_ID) AS UNIQUE_CUSTOMERS,
+        COUNT(DISTINCT WEEK) AS UNIQUE_WEEKS
+    FROM {INFERENCE_TABLE_CLEANED}
 """
 )
 

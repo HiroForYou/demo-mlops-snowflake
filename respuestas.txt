@@ -1,0 +1,21 @@
+1) Estamos de acuerdo en que toda la documentación esté en inglés; lo aplicaremos de forma gradual en los notebooks 01–06 y dejaremos el estándar “English-only” documentado.
+
+2) Vemos sentido en parametrizar BD, esquemas y fechas, pero por ahora, al ser un POC, priorizamos aislar primero los nombres de BD/esquema y luego ir sacando fechas/versiones del código cuando se defina la orquestación.
+
+3) Aceptamos que hay mezcla de SQL y Python; nuestra idea es mantener SQL para DDL/consultas sencillas e ir moviendo la lógica más compleja a funciones Python/Snowpark donde aporte más claridad, sin forzar un “full Snowpark” inmediato.
+
+4) Reconocemos que, en un escenario productivo, FeatureView/Dynamic Tables serían lo deseable; en esta POC mantenemos la tabla de features simple y documentamos que la arquitectura objetivo incluye FeatureView cuando el entorno lo permita, pues actualmente no contamos con permisos.
+
+5) Sabemos que hoy sobrescribimos la tabla de features y no guardamos histórico; estamos abiertos a introducir versionado (snapshot_date o tablas por versión) cuando exista una frecuencia de refresco y un requisito claro de reproducibilidad.
+
+6) Los features se derivan dinámicamente de TRAIN_DATASET_CLEANED excluyendo ids/target/segmentación; si el esquema se estabiliza y se ve necesario, podemos complementar con un listado explícito en metadata o documentación.
+
+7) El flujo de orquestación es 01→06 (validación, features, HPO, entrenamiento, modelo particionado, inferencia); podemos aportar un diagrama de alto nivel y reservar detalles finos (Tasks, crons, SLAs) para cuando se defina el orquestador y la frecuencia de reentrenos.
+
+8) El despliegue actual se apoya en el Model Registry y el alias PRODUCTION; lo vemos como base razonable sobre la que, si se requiere, se puede construir después un pipeline más formal de promoción entre entornos y rollback.
+
+9) GROUP_MODEL hoy es manual por simplicidad y control en el POC; en Snowflake no tenemos una solución nativa de AutoML, así que a futuro pensamos en ampliar el espacio de búsqueda para incluir hiperparámetros + tipo de modelo, pero de momento solo estamos optimizando hiperparámetros con random search dentro de una ventana de tiempo razonable.
+
+10) Somos conscientes de que to_pandas() y el loop secuencial por grupos tienen límites; para los volúmenes actuales lo consideramos aceptable y dejamos abierta la opción de migrar a un patrón más distribuido si el caso escala.
+
+11) Usamos random search como punto de partida razonable para HPO; si este flujo crece en importancia, evaluaremos métodos de búsqueda más avanzados (por ejemplo, enfoques bayesianos que tambien esta disponible pero requiere tiempo) que aprovechen mejor cada trial.

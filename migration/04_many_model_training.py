@@ -1,9 +1,10 @@
 # %% [markdown]
-# # MMT: 16 modelos (LGBM/XGB por stats_ntile_group)
-# Hiperparámetros por grupo desde script 03 → entrenar → registrar en Model Registry.
+# # MMT: 16 Models (LGBM/XGB per stats_ntile_group)
+# Hyperparameters per group from script 03 → train → register in Model Registry.
 
 # %%
 from snowflake.snowpark.context import get_active_session
+from snowflake.snowpark import functions as F
 from snowflake.ml.modeling.distributors.many_model import ManyModelTraining
 from snowflake.ml.registry import Registry
 from snowflake.ml.feature_store import FeatureStore
@@ -15,12 +16,41 @@ import json
 
 session = get_active_session()
 
-session.sql("USE DATABASE BD_AA_DEV").collect()
-session.sql("USE SCHEMA SC_STORAGE_BMX_PS").collect()
+# Configuration: Database, schemas, and tables
+DATABASE = "BD_AA_DEV"
+STORAGE_SCHEMA = "SC_STORAGE_BMX_PS"
+FEATURES_SCHEMA = "SC_FEATURES_BMX"
+MODELS_SCHEMA = "SC_MODELS_BMX"
+TRAIN_TABLE_CLEANED = f"{DATABASE}.{STORAGE_SCHEMA}.TRAIN_DATASET_CLEANED"
+FEATURES_TABLE = f"{DATABASE}.{FEATURES_SCHEMA}.UNI_BOX_FEATURES"
+HYPERPARAMETER_RESULTS_TABLE = f"{DATABASE}.{MODELS_SCHEMA}.HYPERPARAMETER_RESULTS"
+MMT_STAGE = f"{DATABASE}.{MODELS_SCHEMA}.MMT_MODELS"
+DEFAULT_WAREHOUSE = "WH_AA_DEV_DS_SQL"
+
+# Column constants
+TARGET_COLUMN = "UNI_BOX_WEEK"
+STATS_NTILE_GROUP_COL = "STATS_NTILE_GROUP"
+
+# Excluded columns (metadata columns, not features) - defined once at the beginning
+EXCLUDED_COLS = [
+    "CUSTOMER_ID",
+    "BRAND_PRES_RET",
+    "PROD_KEY",
+    "WEEK",
+    "FEATURE_TIMESTAMP",
+    STATS_NTILE_GROUP_COL,
+]
+
+# Cluster scaling configuration
+CLUSTER_SIZE_MMT = 5
+CLUSTER_SIZE_MIN_MMT = 2
+CLUSTER_SIZE_DOWN = 1
+
+session.sql(f"USE DATABASE {DATABASE}").collect()
+session.sql(f"USE SCHEMA {STORAGE_SCHEMA}").collect()
 print(f"✅ {session.get_current_database()}.{session.get_current_schema()}")
 
 USE_CLEANED_TABLES = False
-FEATURES_TABLE = "BD_AA_DEV.SC_FEATURES_BMX.UNI_BOX_FEATURES"
 MMT_SAMPLE_FRACTION = None  # None = 100%
 
 GROUP_MODEL = {
@@ -44,31 +74,31 @@ GROUP_MODEL = {
 _DEFAULT_MODEL = "XGBRegressor"
 
 # %% [markdown]
-# ## 1. Registry y stage
+# ## 1. Registry and Stage
 
 # %%
-session.sql("CREATE STAGE IF NOT EXISTS BD_AA_DEV.SC_MODELS_BMX.MMT_MODELS").collect()
-registry = Registry(session=session, database_name="BD_AA_DEV", schema_name="SC_MODELS_BMX")
-print("✅ Registry + stage listos")
+session.sql(f"CREATE STAGE IF NOT EXISTS {MMT_STAGE}").collect()
+registry = Registry(session=session, database_name=DATABASE, schema_name=MODELS_SCHEMA)
+print("✅ Registry + stage ready")
 
 # %% [markdown]
-# ## 2. Hiperparámetros por grupo (Experiments o tabla)
+# ## 2. Hyperparameters per Group (Experiments or Table)
 
 # %%
 hyperparams_by_group = {}
 experiments_loaded = False
 all_groups_from_data = session.sql(
-    """
-    SELECT DISTINCT stats_ntile_group
-    FROM BD_AA_DEV.SC_STORAGE_BMX_PS.TRAIN_DATASET_CLEANED
-    WHERE stats_ntile_group IS NOT NULL
-    ORDER BY stats_ntile_group
+    f"""
+    SELECT DISTINCT {STATS_NTILE_GROUP_COL}
+    FROM {TRAIN_TABLE_CLEANED}
+    WHERE {STATS_NTILE_GROUP_COL} IS NOT NULL
+    ORDER BY {STATS_NTILE_GROUP_COL}
 """
 ).collect()
 
-expected_groups = [row["STATS_NTILE_GROUP"] for row in all_groups_from_data]
+expected_groups = [row[STATS_NTILE_GROUP_COL] for row in all_groups_from_data]
 
-print("\n🔬 Cargando desde ML Experiments...")
+print("\n🔬 Loading from ML Experiments...")
 try:
     exp_tracking = ExperimentTracking(session)
     from datetime import datetime, timedelta
@@ -81,8 +111,6 @@ try:
         print(f"✅ Found experiment: {experiment_name}")
 
         # Get all runs from this experiment
-        # Note: The exact API may vary - this is a conceptual approach
-        # You may need to query the experiments table directly
         experiments_loaded = True
         print("   ✅ ML Experiments available - loading from experiments")
     except:
@@ -232,7 +260,7 @@ except Exception as e:
     experiments_loaded = False
 
 # %% [markdown]
-# ### 2b. Fallback a tabla
+# ### 2b. Fallback to table
 
 # %%
 if not experiments_loaded or len(hyperparams_by_group) < len(expected_groups):
@@ -255,7 +283,7 @@ if not experiments_loaded or len(hyperparams_by_group) < len(expected_groups):
 
     if table_exists:
         hyperparams_df = session.sql(
-            """
+            f"""
             WITH latest_searches AS (
                 SELECT 
                     group_name,
@@ -267,7 +295,7 @@ if not experiments_loaded or len(hyperparams_by_group) < len(expected_groups):
                     val_mae,
                     created_at,
                     ROW_NUMBER() OVER (PARTITION BY group_name ORDER BY created_at DESC) AS rn
-                FROM BD_AA_DEV.SC_MODELS_BMX.HYPERPARAMETER_RESULTS
+                FROM {HYPERPARAMETER_RESULTS_TABLE}
                 WHERE group_name IS NOT NULL
             )
             SELECT 
@@ -319,7 +347,7 @@ if not experiments_loaded or len(hyperparams_by_group) < len(expected_groups):
         print("   ⚠️  Table does not exist (this is OK if using ML Experiments)")
 
 # %% [markdown]
-# ### 2c. Defaults y validación
+# ### 2c. Defaults and validation
 
 # %%
 if len(hyperparams_by_group) == 0:
@@ -362,8 +390,8 @@ DEFAULT_PARAMS_BY_MODEL = {
     },
 }
 
-print(f"\n📋 Defaults por modelo: {list(DEFAULT_PARAMS_BY_MODEL.keys())}")
-print(f"🔍 Validando cobertura...")
+print(f"\n📋 Defaults per model: {list(DEFAULT_PARAMS_BY_MODEL.keys())}")
+print(f"🔍 Validating coverage...")
 groups_with_hyperparams = set(hyperparams_by_group.keys())
 groups_without_hyperparams = set(expected_groups) - groups_with_hyperparams
 
@@ -377,43 +405,41 @@ else:
     print(f"✅ All {len(expected_groups)} groups have optimized hyperparameters!")
 
 # %% [markdown]
-# ## 3. Datos de entrenamiento
+# ## 3. Training Data
 
 # %%
-print("\n🏪 Cargando datos de entrenamiento...")
+print("\n🏪 Loading training data...")
 
 if USE_CLEANED_TABLES:
     print("📊 Loading from cleaned table: TRAIN_DATASET_CLEANED")
-    training_df = session.table("BD_AA_DEV.SC_STORAGE_BMX_PS.TRAIN_DATASET_CLEANED")
+    training_df = session.table(TRAIN_TABLE_CLEANED)
     print(f"\n✅ Training data loaded from cleaned table")
     print(f"   Total records: {training_df.count():,}")
     print(f"   Columns: {len(training_df.columns)}")
 else:
-    # Preferimos la tabla materializada de features (sin Dynamic Tables).
-    # Si falla por permisos/no existencia, hacemos fallback a la tabla limpia.
+    # Prefer materialized features table (without Dynamic Tables).
+    # If it fails due to permissions/non-existence, fallback to cleaned table.
     try:
-        # Mantener inicialización del Feature Store (aunque no usemos FeatureView)
+        # Initialize Feature Store (even though we don't use FeatureView)
         _fs = FeatureStore(
             session=session,
-            database="BD_AA_DEV",
-            name="SC_FEATURES_BMX",
-            default_warehouse="WH_AA_DEV_DS_SQL",
+            database=DATABASE,
+            name=FEATURES_SCHEMA,
+            default_warehouse=DEFAULT_WAREHOUSE,
         )
-        print("✅ Feature Store inicializado (sin FeatureView)")
+        print("✅ Feature Store initialized (without FeatureView)")
 
         print(f"📊 Loading features from table: {FEATURES_TABLE}")
         features_df = session.table(FEATURES_TABLE)
 
-        print("⏳ Loading target variable and stats_ntile_group from training table...")
-        target_df = session.table(
-            "BD_AA_DEV.SC_STORAGE_BMX_PS.TRAIN_DATASET_CLEANED"
-        ).select(
-            "customer_id", "brand_pres_ret", "week", "uni_box_week", "stats_ntile_group"
+        print(f"⏳ Loading target variable and {STATS_NTILE_GROUP_COL} from training table...")
+        target_df = session.table(TRAIN_TABLE_CLEANED).select(
+            "CUSTOMER_ID", "BRAND_PRES_RET", "PROD_KEY", "WEEK", TARGET_COLUMN, STATS_NTILE_GROUP_COL
         )
 
         print("⏳ Joining features with target...")
         training_df = features_df.join(
-            target_df, on=["customer_id", "brand_pres_ret", "week"], how="inner"
+            target_df, on=["CUSTOMER_ID", "BRAND_PRES_RET", "PROD_KEY", "WEEK"], how="inner"
         )
 
         print(f"\n✅ Training data loaded from features table + target")
@@ -424,17 +450,17 @@ else:
             f"⚠️  Could not load/join features table ({FEATURES_TABLE}): {str(e)[:200]}"
         )
         print("   Falling back to TRAIN_DATASET_CLEANED")
-        training_df = session.table("BD_AA_DEV.SC_STORAGE_BMX_PS.TRAIN_DATASET_CLEANED")
+        training_df = session.table(TRAIN_TABLE_CLEANED)
         print(f"\n✅ Training data loaded from cleaned table (fallback)")
         print(f"   Total records: {training_df.count():,}")
         print(f"   Columns: {len(training_df.columns)}")
 
 PARTITION_COL = next(
-    (c for c in training_df.columns if c.upper() == "STATS_NTILE_GROUP"),
-    "STATS_NTILE_GROUP",
+    (c for c in training_df.columns if c.upper() == STATS_NTILE_GROUP_COL),
+    STATS_NTILE_GROUP_COL,
 )
-print(f"\n📌 Partición: '{PARTITION_COL}'")
-print("\n📊 Filas por grupo:")
+print(f"\n📌 Partition column: '{PARTITION_COL}'")
+print("\n📊 Rows per group:")
 group_counts = (
     training_df.group_by(PARTITION_COL).count().sort(PARTITION_COL)
 )
@@ -444,22 +470,24 @@ if MMT_SAMPLE_FRACTION is not None and 0 < MMT_SAMPLE_FRACTION < 1:
     n_before = training_df.count()
     training_df = training_df.sample(frac=MMT_SAMPLE_FRACTION)
     n_after = training_df.count()
-    print(f"\n⚠️  MMT en modo PRUEBA: usando {MMT_SAMPLE_FRACTION*100:.0f}% de la data ({n_after:,} de {n_before:,} filas)")
+    print(f"\n⚠️  MMT in TEST mode: using {MMT_SAMPLE_FRACTION*100:.0f}% of data ({n_after:,} of {n_before:,} rows)")
 
 # %% [markdown]
-# ## 4. Función de entrenamiento MMT
+# ## 4. MMT Training Function
 
 # %%
 def _get_target_column(df):
     for c in df.columns:
-        if str(c).upper() == "UNI_BOX_WEEK":
+        if str(c).upper() == TARGET_COLUMN:
             return c
-    return "uni_box_week"
+    return TARGET_COLUMN.lower()
 
 
 def _get_feature_cols_numeric(df, excluded_cols, target_col):
-    """Solo columnas numéricas (igual que script 03): Snowflake ML exige int/float/bool."""
-    excluded_upper = {str(x).upper() for x in list(excluded_cols) + [target_col]}
+    """Numeric columns only (same as script 03): Snowflake ML requires int/float/bool."""
+    # excluded_cols is already in UPPER CASE, target_col may vary
+    excluded_upper = {col.upper() if isinstance(col, str) else str(col).upper() for col in excluded_cols}
+    excluded_upper.add(str(target_col).upper())
     return [
         col
         for col in df.columns
@@ -473,7 +501,6 @@ def train_segment_model(data_connector, context):
     from snowflake.ml.modeling.xgboost import XGBRegressor
     from snowflake.ml.modeling.lightgbm import LGBMRegressor
     from snowflake.ml.modeling.linear_model import SGDRegressor
-    from sklearn.model_selection import train_test_split
     from sklearn.metrics import mean_squared_error, mean_absolute_error
     import numpy as np
 
@@ -482,23 +509,20 @@ def train_segment_model(data_connector, context):
     print(f"🚀 Training model for {segment_name}")
     print(f"{'='*80}")
 
+    # NOTE: DataConnector in MMT only provides to_pandas() method, not direct Snowpark DataFrame access
+    # This means we need to convert to pandas, but we can optimize by doing the split efficiently
+    # For very large partitions, consider using MMT_SAMPLE_FRACTION to reduce partition size
     df = data_connector.to_pandas()
     print(f"📊 Data shape: {df.shape}")
-
-    partition_col_in_df = next(
-        (c for c in df.columns if c.upper() == "STATS_NTILE_GROUP"), "STATS_NTILE_GROUP"
-    )
-    excluded_cols = [
-        "customer_id",
-        "brand_pres_ret",
-        "week",
-        "FEATURE_TIMESTAMP",
-        partition_col_in_df,
-    ]
+    
     target_col = _get_target_column(df)
-    feature_cols = _get_feature_cols_numeric(df, excluded_cols, target_col)
+    feature_cols = _get_feature_cols_numeric(df, EXCLUDED_COLS, target_col)
     if len(feature_cols) < 5:
-        feature_cols = [c for c in df.columns if c not in excluded_cols + [target_col]]
+        excluded_upper = {col for col in EXCLUDED_COLS}
+        excluded_upper.add(str(target_col).upper())
+        feature_cols = [c for c in df.columns if str(c).upper() not in excluded_upper]
+    
+    # Get statistics
     X = df[feature_cols].copy()
     for c in feature_cols:
         X[c] = pd.to_numeric(X[c], errors="coerce").fillna(0)
@@ -508,13 +532,15 @@ def train_segment_model(data_connector, context):
     print(f"   Target range: [{y.min():.2f}, {y.max():.2f}]")
     print(f"   Target mean: {y.mean():.2f}")
 
+    # Split using pandas (original behavior)
+    from sklearn.model_selection import train_test_split
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, test_size=0.2, random_state=42
     )
     print(f"   Training set: {X_train.shape[0]:,} samples")
     print(f"   Test set: {X_test.shape[0]:,} samples")
 
-    # Snowflake ML exige int/float/bool (como script 03); asegurar float64
+    # Prepare data
     train_dataset = X_train.copy()
     for c in feature_cols:
         train_dataset[c] = np.asarray(train_dataset[c], dtype=np.float64)
@@ -544,7 +570,7 @@ def train_segment_model(data_connector, context):
         )
 
     def _to_native(v):
-        """Como script 03: numpy -> Python nativo; string numérico -> float/int."""
+        """Same as script 03: numpy -> Python native; numeric string -> float/int."""
         if hasattr(v, "item"):
             return v.item()
         if isinstance(v, (int, float)):
@@ -605,7 +631,7 @@ def train_segment_model(data_connector, context):
     out_col = model.get_output_cols()[0]
     y_pred = np.asarray(pred_df[out_col])
 
-    # Métricas de regresión
+    # Regression metrics
     rmse = np.sqrt(mean_squared_error(y_test, y_pred))
     mae = mean_absolute_error(y_test, y_pred)
 
@@ -614,7 +640,7 @@ def train_segment_model(data_connector, context):
     denom_wape = np.sum(np.abs(y_test))
     wape = float(abs_errors.sum() / denom_wape) if denom_wape > 0 else 0.0
 
-    # MAPE: mean(|y - y_hat| / |y|) * 100, ignorando targets 0
+    # MAPE: mean(|y - y_hat| / |y|) * 100, ignoring targets 0
     non_zero_mask = np.abs(y_test) > 1e-8
     if non_zero_mask.any():
         mape = float(
@@ -651,8 +677,8 @@ def train_segment_model(data_connector, context):
 # %%
 try:
     from snowflake.ml.runtime_cluster import scale_cluster
-    scale_cluster(expected_cluster_size=5, options={"block_until_min_cluster_size": 2})
-    print("✅ Cluster 5 nodos")
+    scale_cluster(expected_cluster_size=CLUSTER_SIZE_MMT, options={"block_until_min_cluster_size": CLUSTER_SIZE_MIN_MMT})
+    print(f"✅ Cluster scaled to {CLUSTER_SIZE_MMT} nodes")
 except Exception as e:
     print(f"⚠️ scale_cluster: {str(e)[:150]}")
 
@@ -664,7 +690,7 @@ except Exception as e:
 
 # %%
 start_time = time.time()
-trainer = ManyModelTraining(train_segment_model, "BD_AA_DEV.SC_MODELS_BMX.MMT_MODELS")
+trainer = ManyModelTraining(train_segment_model, MMT_STAGE)
 training_run = trainer.run(
     partition_by=PARTITION_COL,
     snowpark_dataframe=training_df,
@@ -674,7 +700,7 @@ training_run = trainer.run(
 print(f"\n✅ Run ID: {training_run.run_id}\n")
 
 # %% [markdown]
-# ### 5d. Esperar MMT (opcional; si falla partition_details se sale del bucle)
+# ### 5d. Wait for MMT (optional; if partition_details fails, exit loop)
 
 # %%
 import time as time_module
@@ -692,8 +718,8 @@ while elapsed < MMT_MAX_WAIT:
     try:
         details = training_run.partition_details
     except Exception as e:
-        print(f"\n⚠️  partition_details falló: {str(e)[:180]}")
-        print("   Deja de esperar. Revisa Ray Dashboard o ejecuta 6/7 más tarde.")
+        print(f"\n⚠️  partition_details failed: {str(e)[:180]}")
+        print("   Stop waiting. Check Ray Dashboard or run 6/7 later.")
         break
 
     total_count = len(details)
@@ -711,13 +737,13 @@ while elapsed < MMT_MAX_WAIT:
         break
 
 if not completed:
-    print("\n⏱️  Timeout. Training puede seguir en background; revisa Ray Dashboard o ejecuta 6/7 más tarde.")
+    print("\n⏱️  Timeout. Training may continue in background; check Ray Dashboard or run 6/7 later.")
     try:
         stage_files = session.sql(
-            f"LIST @BD_AA_DEV.SC_MODELS_BMX.MMT_MODELS PATTERN='.*{training_run.run_id}.*'"
+            f"LIST @{MMT_STAGE} PATTERN='.*{training_run.run_id}.*'"
         ).collect()
         if len(stage_files) >= 16:
-            print(f"\n✅ Hay {len(stage_files)} archivos en stage - training probablemente completado.")
+            print(f"\n✅ {len(stage_files)} files in stage - training likely completed.")
             completed = True
     except Exception:
         pass
@@ -728,20 +754,20 @@ print(f"\n⏱️  {((end_time - run_start) / 60):.2f} min")
 
 try:
     from snowflake.ml.runtime_cluster import scale_cluster
-    scale_cluster(expected_cluster_size=1)
-    print("✅ Cluster scale down a 1 nodo")
+    scale_cluster(expected_cluster_size=CLUSTER_SIZE_DOWN)
+    print(f"✅ Cluster scaled down to {CLUSTER_SIZE_DOWN} node")
 except Exception as e:
     print(f"⚠️ scale down: {str(e)[:120]}")
 
 # %% [markdown]
-# ## 6. Resultados por partición
+# ## 6. Results per Partition
 
 # %%
 try:
     partition_details = training_run.partition_details
 except Exception as e:
     partition_details = {}
-    print(f"⚠️ partition_details falló: {str(e)[:200]}. Re-ejecuta desde §3, luego 5c→5d→6.")
+    print(f"⚠️ partition_details failed: {str(e)[:200]}. Re-run from §3, then 5c→5d→6.")
 
 done_ids = []
 failed_ids = []
@@ -773,7 +799,7 @@ for partition_id in partition_details:
 print(f"\n--- Resumen: {len(done_ids)} OK, {len(failed_ids)} FAILED, {len(pending_ids)} pendientes ---")
 
 # %% [markdown]
-# ## 7. Registrar modelos en Registry
+# ## 7. Register Models in Registry
 
 # %%
 version_date = datetime.now().strftime("%Y%m%d_%H%M")
@@ -848,6 +874,26 @@ for partition_id in _reg_partitions:
                 f"   RMSE: {model.rmse:.2f}, MAE: {model.mae:.2f}, "
                 f"WAPE: {model.wape:.4f}, MAPE: {model.mape:.2f}%"
             )
+            
+            # Set PRODUCTION alias to this version (move from previous version if needed)
+            try:
+                model_fqn = f"{DATABASE}.{MODELS_SCHEMA}.{model_name}"
+                new_version_name = f"v_{version_date}"
+
+                # Try to remove PRODUCTION alias from previous version (if any)
+                try:
+                    session.sql(f"ALTER MODEL {model_fqn} VERSION PRODUCTION UNSET ALIAS").collect()
+                except Exception:
+                    # It is fine if there was no previous PRODUCTION alias
+                    pass
+
+                # Assign PRODUCTION alias to the newly logged version
+                session.sql(
+                    f"ALTER MODEL {model_fqn} VERSION {new_version_name} SET ALIAS=PRODUCTION"
+                ).collect()
+                print("   ✅ PRODUCTION alias set")
+            except Exception as e:
+                print(f"   ⚠️  Error setting PRODUCTION alias: {str(e)[:100]}")
 
         except Exception as e:
             print(f"❌ Error registering model: {str(e)[:200]}")
@@ -855,31 +901,30 @@ for partition_id in _reg_partitions:
 print(f"\n✅ {len(registered_models)} model(s) registered successfully!")
 
 # %% [markdown]
-# ## 8. Alias PRODUCTION
+# ## 8. Verify PRODUCTION Alias
 
 # %%
-
+# PRODUCTION alias is already set during registration (section 7)
+# This section verifies all models have the alias
+print("\n📋 Verifying PRODUCTION alias for all registered models...")
 for partition_id, model_info in registered_models.items():
     model_name = model_info["model_name"]
     version = model_info["version"]
-    model_version = model_info["model_version"]
-
     try:
-        try:
-            registry.get_model(model_name).default.unset_alias("PRODUCTION")
-        except Exception:
-            pass
-        model_version.set_alias("PRODUCTION")
-        print(f"✅ {model_name}: PRODUCTION → {version}")
+        model_ref = registry.get_model(model_name)
+        prod_version = model_ref.version("PRODUCTION")
+        # ModelVersion may expose the version name under different attributes depending on library version
+        version_name = getattr(prod_version, "name", getattr(prod_version, "version_name", str(prod_version)))
+        print(f"✅ {model_name}: PRODUCTION → {version_name}")
     except Exception as e:
-        print(f"⚠️  {model_name}: Error setting alias - {str(e)[:100]}")
+        print(f"⚠️  {model_name}: PRODUCTION alias not found - {str(e)[:100]}")
 
 # %% [markdown]
 # ## 9. Resumen
 
 # %%
 _elapsed = (time.time() - start_time) / 60
-print(f"\n✅ MMT: {len(registered_models)}/16 modelos | {_elapsed:.2f} min")
+print(f"\n✅ MMT: {len(registered_models)}/16 models | {_elapsed:.2f} min")
 if registered_models:
     for pid in sorted(registered_models.keys()):
         try:
@@ -890,5 +935,5 @@ if registered_models:
             )
         except Exception:
             pass
-print("   Siguiente: 05_create_partitioned_model.py → 06_partitioned_inference_batch.py")
+print("   Next: 05_create_partitioned_model.py → 06_partitioned_inference_batch.py")
 
