@@ -38,6 +38,7 @@ FEATURES_SCHEMA = "SC_FEATURES_BMX"
 MODELS_SCHEMA = "SC_MODELS_BMX"
 TRAIN_TABLE_CLEANED = f"{DATABASE}.{STORAGE_SCHEMA}.TRAIN_DATASET_CLEANED"
 FEATURES_TABLE = f"{DATABASE}.{FEATURES_SCHEMA}.UNI_BOX_FEATURES"
+FEATURE_VERSIONS_TABLE = f"{DATABASE}.{FEATURES_SCHEMA}.FEATURE_VERSIONS"
 HYPERPARAMETER_RESULTS_TABLE = f"{DATABASE}.{MODELS_SCHEMA}.HYPERPARAMETER_RESULTS"
 DEFAULT_WAREHOUSE = "WH_AA_DEV_DS_SQL"
 
@@ -72,6 +73,31 @@ session.sql(f"USE SCHEMA {STORAGE_SCHEMA}").collect()
 print(f"✅ Connected to Snowflake")
 print(f"   Database: {session.get_current_database()}")
 print(f"   Schema: {session.get_current_schema()}")
+
+# Resolve active feature version (for traceability)
+feature_version_id = None
+feature_snapshot_at = None
+try:
+    version_rows = session.sql(
+        f"""
+        SELECT FEATURE_VERSION_ID, FEATURE_SNAPSHOT_AT, CREATED_AT
+        FROM {FEATURE_VERSIONS_TABLE}
+        WHERE FEATURE_TABLE_NAME = 'UNI_BOX_FEATURES'
+          AND IS_ACTIVE = TRUE
+        ORDER BY CREATED_AT DESC
+        LIMIT 1
+    """
+    ).collect()
+    if version_rows:
+        feature_version_id = version_rows[0]["FEATURE_VERSION_ID"]
+        feature_snapshot_at = version_rows[0]["FEATURE_SNAPSHOT_AT"]
+        print("\n📌 Active feature version for training:")
+        print(f"   FEATURE_VERSION_ID: {feature_version_id}")
+        print(f"   FEATURE_SNAPSHOT_AT: {feature_snapshot_at}")
+    else:
+        print("\n⚠️  No active feature version found in FEATURE_VERSIONS; proceeding without version metadata")
+except Exception as e:
+    print(f"\n⚠️  Could not resolve feature version: {str(e)[:200]}")
 
 # Configuration:
 # - If you don't have permissions for FeatureView/Dynamic Tables, use cleaned tables.
@@ -335,11 +361,21 @@ if not experiments_available:
             val_mae FLOAT,
             n_iter INTEGER,
             sample_size INTEGER,
+            feature_version_id VARCHAR,
+            feature_snapshot_at TIMESTAMP_NTZ,
             created_at TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
         )
     """
     ).collect()
-    print("   ✅ Table created (will be used as primary storage)")
+    # Ensure new columns exist if table was created without them in the past (one ALTER per column)
+    for col_def in ["feature_version_id VARCHAR", "feature_snapshot_at TIMESTAMP_NTZ"]:
+        try:
+            session.sql(
+                f"ALTER TABLE {HYPERPARAMETER_RESULTS_TABLE} ADD COLUMN IF NOT EXISTS {col_def}"
+            ).collect()
+        except Exception:
+            pass
+    print("   ✅ Table created/updated (will be used as primary storage)")
 else:
     print("\n📋 Skipping table creation (using ML Experiments as primary storage)")
 
@@ -471,7 +507,7 @@ def create_train_func_for_tuner(feature_cols, model_type, target_col):
         denom_wape = np.sum(np.abs(y_val))
         val_wape = float(abs_errors.sum() / denom_wape) if denom_wape > 0 else 0.0
 
-        # MAPE: mean(|y - y_hat| / |y|) * 100, ignorando targets 0
+        # MAPE: mean(|y - y_hat| / |y|) * 100, ignoring targets 0
         non_zero_mask = np.abs(y_val) > 1e-8
         if non_zero_mask.any():
             val_mape = float(
@@ -540,7 +576,7 @@ def run_hyperparameter_search_for_one_group(group_name, group_snowpark_df):
 
     # Sample data for this group using Snowpark (avoids loading full group to memory)
     if SAMPLE_RATE_PER_GROUP < 1.0:
-        sampled_snowpark_df = group_snowpark_df.sample(fraction=SAMPLE_RATE_PER_GROUP, seed=42)
+        sampled_snowpark_df = group_snowpark_df.sample(frac=SAMPLE_RATE_PER_GROUP)
         sampled_count = sampled_snowpark_df.count()
         print(
             f"   Sampled: {sampled_count:,} records ({SAMPLE_RATE_PER_GROUP*100:.0f}% of {group_count:,} total)"
@@ -723,6 +759,13 @@ def run_hyperparameter_search_for_one_group(group_name, group_snowpark_df):
                     exp_tracking.log_param("group_name", group_name)
                     exp_tracking.log_param("search_id", search_id)
                     exp_tracking.log_param("algorithm", model_type)
+                    if feature_version_id:
+                        exp_tracking.log_param("feature_version_id", feature_version_id)
+                    if feature_snapshot_at is not None:
+                        exp_tracking.log_param(
+                            "feature_snapshot_at",
+                            str(feature_snapshot_at),
+                        )
 
                 print(f"   ✅ Results logged to ML Experiments (run: {run_name})")
                 experiments_success = True
@@ -751,10 +794,20 @@ def run_hyperparameter_search_for_one_group(group_name, group_snowpark_df):
                     val_mae FLOAT,
                     n_iter INTEGER,
                     sample_size INTEGER,
+                    feature_version_id VARCHAR,
+                    feature_snapshot_at TIMESTAMP_NTZ,
                     created_at TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
                 )
             """
             ).collect()
+            # Ensure new columns exist if table already existed without them (one ALTER per column)
+            for col_def in ["feature_version_id VARCHAR", "feature_snapshot_at TIMESTAMP_NTZ"]:
+                try:
+                    session.sql(
+                        f"ALTER TABLE {HYPERPARAMETER_RESULTS_TABLE} ADD COLUMN IF NOT EXISTS {col_def}"
+                    ).collect()
+                except Exception:
+                    pass
 
             best_params_json = json.dumps(
                 {
@@ -771,10 +824,19 @@ def run_hyperparameter_search_for_one_group(group_name, group_snowpark_df):
             search_id_escaped = search_id.replace("'", "''")
             group_name_escaped = group_name.replace("'", "''")
             algorithm_escaped = model_type.replace("'", "''")
+            if feature_version_id:
+                feature_version_id_escaped = feature_version_id.replace("'", "''")
+                feature_version_id_sql = f"'{feature_version_id_escaped}'"
+            else:
+                feature_version_id_sql = "NULL"
+            if feature_snapshot_at is not None:
+                feature_snapshot_at_sql = f"TO_TIMESTAMP_NTZ('{str(feature_snapshot_at)}')"
+            else:
+                feature_snapshot_at_sql = "NULL"
 
             insert_sql = f"""
                 INSERT INTO {HYPERPARAMETER_RESULTS_TABLE}
-                (search_id, group_name, algorithm, best_params, best_cv_rmse, best_cv_mae, val_rmse, val_mae, n_iter, sample_size)
+                (search_id, group_name, algorithm, best_params, best_cv_rmse, best_cv_mae, val_rmse, val_mae, n_iter, sample_size, feature_version_id, feature_snapshot_at)
                 VALUES (
                     '{search_id_escaped}',
                     '{group_name_escaped}',
@@ -785,7 +847,9 @@ def run_hyperparameter_search_for_one_group(group_name, group_snowpark_df):
                     {val_rmse:.6f},
                     {val_mae:.6f},
                     {NUM_TRIALS},
-                    {sampled_count}
+                    {sampled_count},
+                    {feature_version_id_sql},
+                    {feature_snapshot_at_sql}
                 )
             """
             session.sql(insert_sql).collect()

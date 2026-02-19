@@ -16,6 +16,7 @@
 # %%
 from snowflake.snowpark.context import get_active_session
 from snowflake.ml.feature_store import FeatureStore, Entity, CreationMode
+from datetime import datetime
 
 session = get_active_session()
 
@@ -25,6 +26,7 @@ STORAGE_SCHEMA = "SC_STORAGE_BMX_PS"
 FEATURES_SCHEMA = "SC_FEATURES_BMX"
 TRAIN_TABLE_CLEANED = f"{DATABASE}.{STORAGE_SCHEMA}.TRAIN_DATASET_CLEANED"
 FEATURES_TABLE = f"{DATABASE}.{FEATURES_SCHEMA}.UNI_BOX_FEATURES"
+FEATURE_VERSIONS_TABLE = f"{DATABASE}.{FEATURES_SCHEMA}.FEATURE_VERSIONS"
 DEFAULT_WAREHOUSE = "WH_AA_DEV_DS_SQL"
 
 # Column constants
@@ -156,6 +158,86 @@ print("✅ Feature query created")
 # Count features
 feature_count = feature_df.count()
 print(f"   Total feature records: {feature_count:,}")
+
+# Register feature version for traceability
+print("\n" + "=" * 80)
+print("🧾 REGISTERING FEATURE VERSION METADATA")
+print("=" * 80)
+
+feature_version_id = f"FV_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+print(f"   Feature version ID: {feature_version_id}")
+
+# Create feature versions table if it does not exist
+session.sql(
+    f"""
+    CREATE TABLE IF NOT EXISTS {FEATURE_VERSIONS_TABLE} (
+        FEATURE_VERSION_ID VARCHAR PRIMARY KEY,
+        FEATURE_TABLE_NAME VARCHAR,
+        CREATED_AT TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
+        CREATED_BY VARCHAR,
+        ROW_COUNT NUMBER,
+        FEATURE_COUNT NUMBER,
+        SOURCE_TABLE VARCHAR,
+        FEATURE_SNAPSHOT_AT TIMESTAMP_NTZ,
+        DESCRIPTION VARCHAR,
+        IS_ACTIVE BOOLEAN DEFAULT TRUE
+    )
+"""
+).collect()
+
+# Ensure new columns exist if table was created without them in the past (one ALTER per column)
+for col_def in [
+    "FEATURE_SNAPSHOT_AT TIMESTAMP_NTZ",
+    "DESCRIPTION VARCHAR",
+    "IS_ACTIVE BOOLEAN DEFAULT TRUE",
+]:
+    try:
+        session.sql(
+            f"ALTER TABLE {FEATURE_VERSIONS_TABLE} ADD COLUMN IF NOT EXISTS {col_def}"
+        ).collect()
+    except Exception:
+        pass
+
+# Mark previous versions as inactive for this feature table
+session.sql(
+    f"""
+    UPDATE {FEATURE_VERSIONS_TABLE}
+    SET IS_ACTIVE = FALSE
+    WHERE FEATURE_TABLE_NAME = 'UNI_BOX_FEATURES'
+      AND IS_ACTIVE = TRUE
+"""
+).collect()
+
+# Insert new metadata row for current version
+session.sql(
+    f"""
+    INSERT INTO {FEATURE_VERSIONS_TABLE} (
+        FEATURE_VERSION_ID,
+        FEATURE_TABLE_NAME,
+        CREATED_AT,
+        CREATED_BY,
+        ROW_COUNT,
+        FEATURE_COUNT,
+        SOURCE_TABLE,
+        FEATURE_SNAPSHOT_AT,
+        DESCRIPTION,
+        IS_ACTIVE
+    )
+    SELECT
+        '{feature_version_id}' AS FEATURE_VERSION_ID,
+        'UNI_BOX_FEATURES' AS FEATURE_TABLE_NAME,
+        CURRENT_TIMESTAMP() AS CREATED_AT,
+        CURRENT_USER() AS CREATED_BY,
+        {feature_count} AS ROW_COUNT,
+        {len(feature_columns)} AS FEATURE_COUNT,
+        '{TRAIN_TABLE_CLEANED}' AS SOURCE_TABLE,
+        CURRENT_TIMESTAMP() AS FEATURE_SNAPSHOT_AT,
+        'Materialized from TRAIN_DATASET_CLEANED (script 02_feature_store_setup.py)' AS DESCRIPTION,
+        TRUE AS IS_ACTIVE
+"""
+).collect()
+
+print("✅ Feature version metadata registered")
 
 # %% [markdown]
 # ## 4. Materializar Features en Tabla (sin FeatureView)

@@ -23,6 +23,7 @@ FEATURES_SCHEMA = "SC_FEATURES_BMX"
 MODELS_SCHEMA = "SC_MODELS_BMX"
 TRAIN_TABLE_CLEANED = f"{DATABASE}.{STORAGE_SCHEMA}.TRAIN_DATASET_CLEANED"
 FEATURES_TABLE = f"{DATABASE}.{FEATURES_SCHEMA}.UNI_BOX_FEATURES"
+FEATURE_VERSIONS_TABLE = f"{DATABASE}.{FEATURES_SCHEMA}.FEATURE_VERSIONS"
 HYPERPARAMETER_RESULTS_TABLE = f"{DATABASE}.{MODELS_SCHEMA}.HYPERPARAMETER_RESULTS"
 MMT_STAGE = f"{DATABASE}.{MODELS_SCHEMA}.MMT_MODELS"
 DEFAULT_WAREHOUSE = "WH_AA_DEV_DS_SQL"
@@ -49,6 +50,31 @@ CLUSTER_SIZE_DOWN = 1
 session.sql(f"USE DATABASE {DATABASE}").collect()
 session.sql(f"USE SCHEMA {STORAGE_SCHEMA}").collect()
 print(f"✅ {session.get_current_database()}.{session.get_current_schema()}")
+
+# Resolve active feature version (for model traceability)
+feature_version_id = None
+feature_snapshot_at = None
+try:
+    _version_rows = session.sql(
+        f"""
+        SELECT FEATURE_VERSION_ID, FEATURE_SNAPSHOT_AT, CREATED_AT
+        FROM {FEATURE_VERSIONS_TABLE}
+        WHERE FEATURE_TABLE_NAME = 'UNI_BOX_FEATURES'
+          AND IS_ACTIVE = TRUE
+        ORDER BY CREATED_AT DESC
+        LIMIT 1
+    """
+    ).collect()
+    if _version_rows:
+        feature_version_id = _version_rows[0]["FEATURE_VERSION_ID"]
+        feature_snapshot_at = _version_rows[0]["FEATURE_SNAPSHOT_AT"]
+        print("\n📌 Active feature version for model training:")
+        print(f"   FEATURE_VERSION_ID: {feature_version_id}")
+        print(f"   FEATURE_SNAPSHOT_AT: {feature_snapshot_at}")
+    else:
+        print("\n⚠️  No active feature version found in FEATURE_VERSIONS; models will be registered without feature version metadata")
+except Exception as e:
+    print(f"\n⚠️  Could not resolve feature version for models: {str(e)[:200]}")
 
 USE_CLEANED_TABLES = False
 MMT_SAMPLE_FRACTION = None  # None = 100%
@@ -840,6 +866,12 @@ for partition_id in _reg_partitions:
                 "group": partition_id,
                 "hyperparameter_search_id": group_search_id or "default",
             }
+
+            if feature_version_id:
+                model_metrics["feature_version_id"] = feature_version_id
+            if feature_snapshot_at is not None:
+                model_metrics["feature_snapshot_at"] = str(feature_snapshot_at)
+            model_metrics["feature_table_name"] = FEATURES_TABLE
 
             if group_hyperparams:
                 for key, value in group_hyperparams.items():

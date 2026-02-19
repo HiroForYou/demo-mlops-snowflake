@@ -12,7 +12,7 @@ import math
 
 # %%
 # Configuration
-INFERENCE_SAMPLE_FRACTION = 0.01
+INFERENCE_SAMPLE_FRACTION = 1
 
 # Number of rows per batch. Leave as None to disable batching.
 BATCH_SIZE = 1_000_000
