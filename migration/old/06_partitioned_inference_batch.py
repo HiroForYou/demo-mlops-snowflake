@@ -101,6 +101,9 @@ start_time = time.time()
 total_rows = input_df.count()
 print(f"📊 Input rows (after sampling if applied): {total_rows:,}")
 
+# Order for batching (Snowpark order_by + limit/offset)
+ORDER_COLS_SNOWPARK = [F.col("CUSTOMER_ID"), F.col("WEEK"), F.col("BRAND_PRES_RET"), F.col("PROD_KEY")]
+
 if BATCH_SIZE is None:
     # Inference without batching (single pass)
     insert_predictions_sql = f"""
@@ -154,72 +157,73 @@ if BATCH_SIZE is None:
 
     session.sql(insert_predictions_sql).collect()
 else:
-    # Inference in batches of BATCH_SIZE rows using ROW_NUMBER over the input view
+    # Inference in batches with Snowpark: cada batch es un DataFrame (order_by + limit/offset),
+    # se crea vista temporal BATCH_PAGE y el INSERT corre en Snowflake sobre esa vista.
     num_batches = math.ceil(total_rows / BATCH_SIZE) if total_rows > 0 else 0
-    print(f"📦 Running in batches of {BATCH_SIZE:,} rows ({num_batches} batch(es))")
+    print(f"📦 Running in batches of {BATCH_SIZE:,} rows ({num_batches} batch(es)) [Snowpark order_by + limit/offset]")
+
+    # SQL de INSERT: lee desde la vista BATCH_PAGE (creada por Snowpark por cada batch)
+    insert_from_batch_page_sql = f"""
+    INSERT INTO {PREDICTIONS_TABLE}
+    (CUSTOMER_ID, STATS_NTILE_GROUP, WEEK, BRAND_PRES_RET, PROD_KEY, PREDICTED_UNI_BOX_WEEK, MODEL_VERSION)
+    SELECT
+        p.CUSTOMER_ID,
+        p.STATS_NTILE_GROUP,
+        p.WEEK,
+        p.BRAND_PRES_RET,
+        p.PROD_KEY,
+        p.predicted_uni_box_week,
+        '{model_version_name}' AS MODEL_VERSION
+    FROM BATCH_PAGE t,
+    TABLE(
+      MODEL({MODEL_FQN}, PRODUCTION)!PREDICT(
+        t.CUSTOMER_ID,
+        t.STATS_NTILE_GROUP,
+        t.WEEK,
+        t.BRAND_PRES_RET,
+        t.PROD_KEY,
+        t.SUM_PAST_12_WEEKS,
+        t.AVG_PAST_12_WEEKS,
+        t.MAX_PAST_24_WEEKS,
+        t.SUM_PAST_24_WEEKS,
+        t.WEEK_OF_YEAR,
+        t.AVG_AVG_DAILY_ALL_HOURS,
+        t.SUM_P4W,
+        t.AVG_PAST_24_WEEKS,
+        t.PHARM_SUPER_CONV,
+        t.WINES_LIQUOR,
+        t.GROCERIES,
+        t.MAX_PREV2,
+        t.AVG_PREV2,
+        t.MAX_PREV3,
+        t.AVG_PREV3,
+        t.W_M1_TOTAL,
+        t.W_M2_TOTAL,
+        t.W_M3_TOTAL,
+        t.W_M4_TOTAL,
+        t.SPEC_FOODS,
+        t.NUM_COOLERS,
+        t.NUM_DOORS,
+        t.MAX_PAST_4_WEEKS,
+        t.SUM_PAST_4_WEEKS,
+        t.AVG_PAST_4_WEEKS,
+        t.MAX_PAST_12_WEEKS
+      ) OVER (PARTITION BY t.STATS_NTILE_GROUP)
+    ) p
+    """
 
     for batch_idx in range(num_batches):
-        batch_start = batch_idx * BATCH_SIZE + 1
-        batch_end = min((batch_idx + 1) * BATCH_SIZE, total_rows)
-        print(f"   ➜ Batch {batch_idx + 1}/{num_batches}: rows {batch_start:,} - {batch_end:,}")
+        offset = batch_idx * BATCH_SIZE
+        print(f"   ➜ Batch {batch_idx + 1}/{num_batches} (offset {offset:,})")
 
-        insert_predictions_sql_batch = f"""
-        INSERT INTO {PREDICTIONS_TABLE}
-        (CUSTOMER_ID, STATS_NTILE_GROUP, WEEK, BRAND_PRES_RET, PROD_KEY, PREDICTED_UNI_BOX_WEEK, MODEL_VERSION)
-        WITH INPUT_BATCH AS (
-            SELECT
-                *,
-                ROW_NUMBER() OVER (ORDER BY CUSTOMER_ID, WEEK, BRAND_PRES_RET, PROD_KEY) AS RN
-            FROM INFERENCE_INPUT
+        # Snowpark: define el batch como DataFrame (lazy) y crea vista temporal en Snowflake
+        batch_df = (
+            input_df.order_by(*ORDER_COLS_SNOWPARK)
+            .limit(BATCH_SIZE, offset=offset)
         )
-        SELECT
-            p.CUSTOMER_ID,
-            p.STATS_NTILE_GROUP,
-            p.WEEK,
-            p.BRAND_PRES_RET,
-            p.PROD_KEY,
-            p.predicted_uni_box_week,
-            '{model_version_name}' AS MODEL_VERSION
-        FROM INPUT_BATCH t,
-        TABLE(
-          MODEL({MODEL_FQN}, PRODUCTION)!PREDICT(
-            t.CUSTOMER_ID,
-            t.STATS_NTILE_GROUP,
-            t.WEEK,
-            t.BRAND_PRES_RET,
-            t.PROD_KEY,
-            t.SUM_PAST_12_WEEKS,
-            t.AVG_PAST_12_WEEKS,
-            t.MAX_PAST_24_WEEKS,
-            t.SUM_PAST_24_WEEKS,
-            t.WEEK_OF_YEAR,
-            t.AVG_AVG_DAILY_ALL_HOURS,
-            t.SUM_P4W,
-            t.AVG_PAST_24_WEEKS,
-            t.PHARM_SUPER_CONV,
-            t.WINES_LIQUOR,
-            t.GROCERIES,
-            t.MAX_PREV2,
-            t.AVG_PREV2,
-            t.MAX_PREV3,
-            t.AVG_PREV3,
-            t.W_M1_TOTAL,
-            t.W_M2_TOTAL,
-            t.W_M3_TOTAL,
-            t.W_M4_TOTAL,
-            t.SPEC_FOODS,
-            t.NUM_COOLERS,
-            t.NUM_DOORS,
-            t.MAX_PAST_4_WEEKS,
-            t.SUM_PAST_4_WEEKS,
-            t.AVG_PAST_4_WEEKS,
-            t.MAX_PAST_12_WEEKS
-          ) OVER (PARTITION BY t.STATS_NTILE_GROUP)
-        ) p
-        WHERE t.RN BETWEEN {batch_start} AND {batch_end}
-        """
+        batch_df.create_or_replace_temp_view("BATCH_PAGE")
 
-        session.sql(insert_predictions_sql_batch).collect()
+        session.sql(insert_from_batch_page_sql).collect()
 
 elapsed = time.time() - start_time
 

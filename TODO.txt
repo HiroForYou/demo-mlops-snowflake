@@ -1,0 +1,8 @@
+crear baseline de predicciones de train para david
+
+
+escalamiento de partciones en data para feature store. Micro particiones.
+
+
+IMPORTANTE:
+Tensión entre los dos objetivos: Si usas time-series split (test = semanas más recientes) no puedes garantizar distribución del target en train/test al mismo tiempo, porque la distribución puede cambiar con el tiempo por definición. ¿El objetivo principal es respetar el orden temporal (no data leakage), o preservar distribución? ¿O ambos con algún compromiso?

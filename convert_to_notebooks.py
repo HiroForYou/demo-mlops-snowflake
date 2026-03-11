@@ -12,6 +12,7 @@ def convert_py_to_notebook(py_file_path, output_notebook_path):
     cells = []
     current_cell = []
     current_cell_type = None
+    current_cell_name = None
     
     i = 0
     while i < len(lines):
@@ -21,15 +22,19 @@ def convert_py_to_notebook(py_file_path, output_notebook_path):
         if line.strip() == '# %% [markdown]':
             # Guardar celda anterior si existe
             if current_cell and current_cell_type:
+                cell_meta = {}
+                if current_cell_name:
+                    cell_meta['name'] = current_cell_name
                 cells.append({
                     'cell_type': current_cell_type,
-                    'metadata': {},
+                    'metadata': cell_meta,
                     'source': current_cell
                 })
             
             # Iniciar nueva celda markdown
             current_cell = []
             current_cell_type = 'markdown'
+            current_cell_name = None
             i += 1
             continue
         
@@ -37,15 +42,19 @@ def convert_py_to_notebook(py_file_path, output_notebook_path):
         elif line.strip() == '# %%':
             # Guardar celda anterior si existe
             if current_cell and current_cell_type:
+                cell_meta = {}
+                if current_cell_name:
+                    cell_meta['name'] = current_cell_name
                 cells.append({
                     'cell_type': current_cell_type,
-                    'metadata': {},
+                    'metadata': cell_meta,
                     'source': current_cell
                 })
             
             # Iniciar nueva celda de código
             current_cell = []
             current_cell_type = 'code'
+            current_cell_name = None
             i += 1
             continue
         
@@ -53,7 +62,13 @@ def convert_py_to_notebook(py_file_path, output_notebook_path):
         if current_cell_type == 'markdown':
             # Remover el '#' inicial de las líneas markdown
             if line.startswith('# '):
-                current_cell.append(line[2:])
+                content = line[2:]
+                current_cell.append(content)
+                if not current_cell_name and content.startswith(('# ', '## ')):
+                    # Limpiamos los hashes para obtener el nombre limpio
+                    clean_name = content.lstrip('#').strip()
+                    if clean_name:
+                        current_cell_name = clean_name
             elif line.strip() == '':
                 current_cell.append('')
             else:
@@ -70,9 +85,12 @@ def convert_py_to_notebook(py_file_path, output_notebook_path):
     
     # Agregar última celda
     if current_cell and current_cell_type:
+        cell_meta = {}
+        if current_cell_name:
+            cell_meta['name'] = current_cell_name
         cells.append({
             'cell_type': current_cell_type,
-            'metadata': {},
+            'metadata': cell_meta,
             'source': current_cell
         })
     
@@ -120,9 +138,7 @@ def convert_py_to_notebook(py_file_path, output_notebook_path):
             cell['outputs'] = []
         elif cell['cell_type'] == 'markdown':
             # Metadata específica para celdas markdown en Snowflake
-            cell['metadata'] = {
-                'codeCollapsed': True
-            }
+            cell['metadata']['codeCollapsed'] = True
     
     # Guardar notebook
     with open(output_notebook_path, 'w', encoding='utf-8') as f:
@@ -134,6 +150,9 @@ def convert_py_to_notebook(py_file_path, output_notebook_path):
 migration_dir = 'migration'
 notebooks_dir = os.path.join(migration_dir, 'notebooks')
 
+# Crear directorio de notebooks si no existe
+os.makedirs(notebooks_dir, exist_ok=True)
+
 # Archivos a convertir
 scripts = [
     '01_data_validation_and_cleaning.py',
@@ -142,7 +161,18 @@ scripts = [
     '03b_hyperparameter_search_bayesian.py',
     '04_many_model_training.py',
     '05_create_partitioned_model.py',
-    '06_partitioned_inference_batch.py'
+    '06_create_baselines.py',
+    '06a_setup_and_inference.py',
+    '06b_data_drift_baseline.py',
+    '06c_prediction_drift_baseline.py',
+    '06d_performance_drift_baseline.py',
+    '07_environment_change.py',
+    '08_partitioned_inference_batch.py',
+    '09_ml_observability.py',
+    '09a_setup.py',
+    '09b_data_drift.py',
+    '09c_prediction_drift.py',
+    '09d_performance_drift.py'
 ]
 
 for script in scripts:

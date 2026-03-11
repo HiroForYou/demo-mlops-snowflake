@@ -1,429 +1,338 @@
 # %% [markdown]
-# # Migration: Data Validation and Cleaning
+# # Data Validation and Cleaning
 #
-# ## Overview
-# This script validates and cleans the training and inference datasets before creating the Feature Store.
-#
-# ## What We'll Do:
-# 1. Validate table structures and data quality
-# 2. Clean data (handle NULLs, outliers)
-# 3. Verify feature compatibility between train and inference
-# 4. Generate data quality reports
+# Validates and cleans the training and inference datasets before feature
+# materialization.  Steps performed:
+# 1. Validate table structure and data quality for both datasets.
+# 2. Clean data (remove NULLs, cap outliers at the 99th percentile).
+# 3. Verify feature column compatibility between training and inference.
+# 4. Generate a per-group distribution report for STATS_NTILE_GROUP.
+
+# %% [markdown]
+# ## 1. Setup
 
 # %%
 from snowflake.snowpark.context import get_active_session
 
 session = get_active_session()
 
-# Configuration: Database, schemas, and tables
+# %% [markdown]
+# ### 1A. Constants
+
+# %%
 DATABASE = "BD_AA_DEV"
 STORAGE_SCHEMA = "SC_STORAGE_BMX_PS"
-TRAIN_TABLE_STRUCTURED = f"{DATABASE}.{STORAGE_SCHEMA}.TRAIN_DATASET_STRUCTURED"
+TRAIN_TABLE_STRUCTURED  = f"{DATABASE}.{STORAGE_SCHEMA}.TRAIN_DATASET_STRUCTURED"
 INFERENCE_TABLE_STRUCTURED = f"{DATABASE}.{STORAGE_SCHEMA}.INFERENCE_DATASET_STRUCTURED"
-TRAIN_TABLE_CLEANED = f"{DATABASE}.{STORAGE_SCHEMA}.TRAIN_DATASET_CLEANED"
+TRAIN_TABLE_CLEANED     = f"{DATABASE}.{STORAGE_SCHEMA}.TRAIN_DATASET_CLEANED"
+TRAIN_TABLE_HOLDOUT     = f"{DATABASE}.{STORAGE_SCHEMA}.TRAIN_DATASET_HOLDOUT"
 INFERENCE_TABLE_CLEANED = f"{DATABASE}.{STORAGE_SCHEMA}.INFERENCE_DATASET_CLEANED"
 
-# Column constants
-TARGET_COLUMN = "UNI_BOX_WEEK"
+TARGET_COLUMN         = "UNI_BOX_WEEK"
 STATS_NTILE_GROUP_COL = "STATS_NTILE_GROUP"
 
-# Excluded columns (metadata columns, not features) - defined once at the beginning
+HOLDOUT_FRACTION = 0.10  # 10% temporal holdout for baseline drift
+
+# Metadata / identifier columns excluded from the feature set
 EXCLUDED_COLS = [
     "CUSTOMER_ID",
     "BRAND_PRES_RET",
     "WEEK",
-    "GROUP",
-    "STATS_GROUP",
-    "PERCENTILE_GROUP",
     STATS_NTILE_GROUP_COL,
     "PROD_KEY",
 ]
 
-# Set context
 session.sql(f"USE DATABASE {DATABASE}").collect()
 session.sql(f"USE SCHEMA {STORAGE_SCHEMA}").collect()
-
-print(f"✅ Connected to Snowflake")
-print(f"   Database: {session.get_current_database()}")
-print(f"   Schema: {session.get_current_schema()}")
+print(f"Session: {session.get_current_database()}.{session.get_current_schema()}")
 
 # %% [markdown]
-# ## 1. Validate Training Dataset
+# ## 2. Validate Training Dataset
 
 # %%
-print("\n" + "=" * 80)
-print("📊 VALIDATING TRAINING DATASET")
-print("=" * 80)
-
-# Check if table exists
 try:
     train_df = session.table(TRAIN_TABLE_STRUCTURED)
     total_rows = train_df.count()
-    print(f"\n✅ Table exists: TRAIN_DATASET_STRUCTURED")
-    print(f"   Total rows: {total_rows:,}")
+    print(f"TRAIN_DATASET_STRUCTURED: {total_rows:,} rows")
 except Exception as e:
-    print(f"\n❌ Error accessing table: {str(e)}")
+    print(f"Error accessing table: {str(e)}")
     raise
 
-# Get column information
 columns = train_df.columns
-print(f"\n📋 Columns ({len(columns)}):")
-for col in columns:
-    print(f"   - {col}")
+print(f"Columns ({len(columns)}): {', '.join(columns)}")
 
-# Check for target variable (case-insensitive)
-columns_upper = [col.upper() for col in columns]
-if TARGET_COLUMN in columns_upper:
-    # Find the actual column name (preserving case)
-    target_col = columns[columns_upper.index(TARGET_COLUMN)]
-    print(f"\n✅ Target variable '{TARGET_COLUMN}' found (as '{target_col}')")
+if TARGET_COLUMN in columns:
+    print(f"Target column found: '{TARGET_COLUMN}'")
 else:
-    print(f"\n❌ Target variable '{TARGET_COLUMN}' NOT found!")
-    print(f"   Available columns: {', '.join(columns)}")
-    raise ValueError(f"Target variable '{TARGET_COLUMN}' is required")
+    raise ValueError(f"Target variable '{TARGET_COLUMN}' not found in training dataset")
 
 # %% [markdown]
-# ## 2. Validate Inference Dataset
+# ## 3. Validate Inference Dataset
 
 # %%
-print("\n" + "=" * 80)
-print("📊 VALIDATING INFERENCE DATASET")
-print("=" * 80)
-
 try:
     inference_df = session.table(INFERENCE_TABLE_STRUCTURED)
     inference_rows = inference_df.count()
-    print(f"\n✅ Table exists: INFERENCE_DATASET_STRUCTURED")
-    print(f"   Total rows: {inference_rows:,}")
+    print(f"INFERENCE_DATASET_STRUCTURED: {inference_rows:,} rows")
 except Exception as e:
-    print(f"\n❌ Error accessing table: {str(e)}")
+    print(f"Error accessing table: {str(e)}")
     raise
 
-# Verify target is NOT in inference
 inference_columns = inference_df.columns
-inference_columns_upper = [col.upper() for col in inference_columns]
-if TARGET_COLUMN in inference_columns_upper:
-    print(f"\n⚠️  WARNING: Target variable '{TARGET_COLUMN}' found in inference dataset")
-    print(f"   This is expected - inference should not have target values")
+
+if TARGET_COLUMN in inference_columns:
+    print(f"WARNING: target '{TARGET_COLUMN}' found in inference dataset — expected to be absent")
 else:
-    print(f"\n✅ Target variable correctly absent from inference dataset")
+    print(f"Target column correctly absent from inference dataset")
 
 # %% [markdown]
-# ## 3. Check Data Quality - NULLs and Missing Values
+# ## 4. Data Quality — NULL Values
 
 # %%
-print("\n" + "=" * 80)
-print("🔍 DATA QUALITY CHECK - NULL VALUES")
-print("=" * 80)
-
-# Check NULLs in training data
-null_check_train = session.sql(
-    f"""
+print("\nNULL check — training data:")
+session.sql(f"""
     SELECT
         COUNT(*) AS TOTAL_ROWS,
-        SUM(CASE WHEN {TARGET_COLUMN} IS NULL THEN 1 ELSE 0 END) AS NULL_TARGET,
-        SUM(CASE WHEN CUSTOMER_ID IS NULL THEN 1 ELSE 0 END) AS NULL_CUSTOMER_ID,
-        SUM(CASE WHEN WEEK IS NULL THEN 1 ELSE 0 END) AS NULL_WEEK
-    FROM {TRAIN_TABLE_STRUCTURED}
-"""
-)
-
-print("\n📊 NULL Values in Training Data:")
-null_check_train.show()
-
-# Check for NULLs in key features
-feature_null_check = session.sql(
-    f"""
-    SELECT
-        SUM(CASE WHEN SUM_PAST_12_WEEKS IS NULL THEN 1 ELSE 0 END) AS NULL_SUM_PAST_12_WEEKS,
-        SUM(CASE WHEN AVG_PAST_12_WEEKS IS NULL THEN 1 ELSE 0 END) AS NULL_AVG_PAST_12_WEEKS,
-        SUM(CASE WHEN WEEK_OF_YEAR IS NULL THEN 1 ELSE 0 END) AS NULL_WEEK_OF_YEAR,
+        SUM(CASE WHEN {TARGET_COLUMN}   IS NULL THEN 1 ELSE 0 END) AS NULL_TARGET,
+        SUM(CASE WHEN CUSTOMER_ID       IS NULL THEN 1 ELSE 0 END) AS NULL_CUSTOMER_ID,
+        SUM(CASE WHEN WEEK              IS NULL THEN 1 ELSE 0 END) AS NULL_WEEK,
         SUM(CASE WHEN STATS_NTILE_GROUP IS NULL THEN 1 ELSE 0 END) AS NULL_STATS_NTILE_GROUP
     FROM {TRAIN_TABLE_STRUCTURED}
-"""
-)
-
-print("\n📊 NULL Values in Key Features:")
-feature_null_check.show()
+""").show()
 
 # %% [markdown]
-# ## 4. Check Target Variable Distribution
+# ## 5. Target Variable Distribution
 
 # %%
-print("\n" + "=" * 80)
-print("📈 TARGET VARIABLE DISTRIBUTION")
-print("=" * 80)
-
-target_stats = session.sql(
-    f"""
+print("Target variable statistics:")
+session.sql(f"""
     SELECT
-        COUNT(*) AS TOTAL_RECORDS,
-        COUNT(DISTINCT {TARGET_COLUMN}) AS UNIQUE_VALUES,
-        MIN({TARGET_COLUMN}) AS MIN_VALUE,
-        MAX({TARGET_COLUMN}) AS MAX_VALUE,
-        AVG({TARGET_COLUMN}) AS MEAN_VALUE,
+        COUNT(*)    AS TOTAL_RECORDS,
+        MIN({TARGET_COLUMN})  AS MIN_VALUE,
+        MAX({TARGET_COLUMN})  AS MAX_VALUE,
+        AVG({TARGET_COLUMN})  AS MEAN_VALUE,
         STDDEV({TARGET_COLUMN}) AS STDDEV_VALUE,
         PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY {TARGET_COLUMN}) AS Q1,
         PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY {TARGET_COLUMN}) AS MEDIAN,
         PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY {TARGET_COLUMN}) AS Q3
     FROM {TRAIN_TABLE_STRUCTURED}
     WHERE {TARGET_COLUMN} IS NOT NULL
-"""
-)
+""").show()
 
-print("\n📊 Target Variable (uni_box_week) Statistics:")
-target_stats.show()
-
-# Check for outliers (values beyond 3 standard deviations)
-outlier_check = session.sql(
-    f"""
+print("Outliers (> 3 std dev):")
+session.sql(f"""
     WITH stats AS (
-        SELECT
-            AVG({TARGET_COLUMN}) AS mean_val,
-            STDDEV({TARGET_COLUMN}) AS stddev_val
+        SELECT AVG({TARGET_COLUMN}) AS mean_val, STDDEV({TARGET_COLUMN}) AS stddev_val
         FROM {TRAIN_TABLE_STRUCTURED}
         WHERE {TARGET_COLUMN} IS NOT NULL
     )
-    SELECT
-        COUNT(*) AS OUTLIER_COUNT,
-        MIN({TARGET_COLUMN}) AS MIN_OUTLIER,
-        MAX({TARGET_COLUMN}) AS MAX_OUTLIER
+    SELECT COUNT(*) AS OUTLIER_COUNT,
+           MIN({TARGET_COLUMN}) AS MIN_OUTLIER,
+           MAX({TARGET_COLUMN}) AS MAX_OUTLIER
     FROM {TRAIN_TABLE_STRUCTURED}, stats
     WHERE {TARGET_COLUMN} IS NOT NULL
-        AND ({TARGET_COLUMN} < mean_val - 3 * stddev_val 
-             OR {TARGET_COLUMN} > mean_val + 3 * stddev_val)
-"""
-)
-
-print("\n📊 Outliers (>3 std dev):")
-outlier_check.show()
+      AND ({TARGET_COLUMN} < mean_val - 3 * stddev_val
+           OR {TARGET_COLUMN} > mean_val + 3 * stddev_val)
+""").show()
 
 # %% [markdown]
-# ## 5. Verify Feature Compatibility
+# ## 6. Feature Compatibility Check
 
 # %%
-print("\n" + "=" * 80)
-print("🔗 FEATURE COMPATIBILITY CHECK")
-print("=" * 80)
-
-# Get feature columns from training (exclude target + excluded)
-# EXCLUDED_COLS is already in UPPER CASE, so we compare case-insensitively
-excluded_cols_upper = {col for col in EXCLUDED_COLS}
+excluded_cols_set = set(EXCLUDED_COLS)
 train_feature_cols = [
-    col for col in columns 
-    if col.upper() not in excluded_cols_upper and col.upper() != TARGET_COLUMN
+    col for col in columns
+    if col not in excluded_cols_set and col != TARGET_COLUMN
 ]
-
-# Get feature columns from inference (exclude excluded)
 inference_feature_cols = [
-    col for col in inference_columns 
-    if col.upper() not in excluded_cols_upper
+    col for col in inference_columns
+    if col not in excluded_cols_set
 ]
 
-print(f"\n📋 Training Features ({len(train_feature_cols)}):")
-for col in sorted(train_feature_cols):
-    print(f"   - {col}")
-
-print(f"\n📋 Inference Features ({len(inference_feature_cols)}):")
-for col in sorted(inference_feature_cols):
-    print(f"   - {col}")
-
-# Check if features match
 missing_in_inference = set(train_feature_cols) - set(inference_feature_cols)
-missing_in_train = set(inference_feature_cols) - set(train_feature_cols)
+missing_in_train     = set(inference_feature_cols) - set(train_feature_cols)
 
 if missing_in_inference:
-    print(f"\n⚠️  Features in training but NOT in inference:")
-    for col in missing_in_inference:
-        print(f"   - {col}")
-
+    print(f"Features in training but NOT in inference: {sorted(missing_in_inference)}")
 if missing_in_train:
-    print(f"\n⚠️  Features in inference but NOT in training:")
-    for col in missing_in_train:
-        print(f"   - {col}")
-
+    print(f"Features in inference but NOT in training: {sorted(missing_in_train)}")
 if not missing_in_inference and not missing_in_train:
-    print(f"\n✅ All features match between training and inference!")
+    print(f"All features match ({len(train_feature_cols)} features)")
 
 # %% [markdown]
-# ## 6. Create Cleaned Tables
+# ## 7. Create Cleaned Tables
 
 # %%
-print("\n" + "=" * 80)
-print("🧹 CREATING CLEANED TABLES")
-print("=" * 80)
+# Split the cleaned data temporally by group: newest X% becomes the holdout set
+# We use a TEMPORARY TABLE of thresholds to avoid Data Skew when ordering 
+# millions of rows in a few partitions. 
+# 1. We count records per group and per week (fast aggregation).
+# 2. We calculate the cumulative sum of records to find the 90% threshold week.
+temp_thresholds_table = f"{TRAIN_TABLE_CLEANED}_TEMP_THRESHOLDS"
 
-# Create cleaned training table
-print("\n📝 Creating cleaned training table...")
-
-cleaned_train_sql = f"""
-CREATE OR REPLACE TABLE {TRAIN_TABLE_CLEANED} AS
-SELECT *
-FROM {TRAIN_TABLE_STRUCTURED}
-WHERE {TARGET_COLUMN} IS NOT NULL
-    AND CUSTOMER_ID IS NOT NULL
-    AND WEEK IS NOT NULL
-    AND {TARGET_COLUMN} >= 0
-    AND {TARGET_COLUMN} <= (
-        SELECT PERCENTILE_CONT(0.99) WITHIN GROUP (ORDER BY {TARGET_COLUMN})
+session.sql(f"""
+    CREATE TEMPORARY TABLE {temp_thresholds_table} AS
+    WITH base_filtered AS (
+        SELECT {STATS_NTILE_GROUP_COL}, WEEK, COUNT(*) as weekly_rows
         FROM {TRAIN_TABLE_STRUCTURED}
         WHERE {TARGET_COLUMN} IS NOT NULL
+          AND CUSTOMER_ID IS NOT NULL
+          AND WEEK IS NOT NULL
+          AND {TARGET_COLUMN} >= 0
+          AND {TARGET_COLUMN} <= (
+              SELECT PERCENTILE_CONT(0.99) WITHIN GROUP (ORDER BY {TARGET_COLUMN})
+              FROM {TRAIN_TABLE_STRUCTURED}
+              WHERE {TARGET_COLUMN} IS NOT NULL
+          )
+        GROUP BY {STATS_NTILE_GROUP_COL}, WEEK
+    ),
+    cumulative_counts AS (
+        SELECT {STATS_NTILE_GROUP_COL},
+               WEEK,
+               weekly_rows,
+               SUM(weekly_rows) OVER (PARTITION BY {STATS_NTILE_GROUP_COL} ORDER BY WEEK ASC) as running_total,
+               SUM(weekly_rows) OVER (PARTITION BY {STATS_NTILE_GROUP_COL}) as total_group_rows
+        FROM base_filtered
+    ),
+    percentiles AS (
+        SELECT {STATS_NTILE_GROUP_COL},
+               WEEK,
+               running_total / total_group_rows as time_percentile
+        FROM cumulative_counts
+    ),
+    thresholds AS (
+        SELECT {STATS_NTILE_GROUP_COL}, MIN(WEEK) as cutoff_week
+        FROM percentiles
+        WHERE time_percentile >= (1.0 - {HOLDOUT_FRACTION})
+        GROUP BY {STATS_NTILE_GROUP_COL}
     )
-"""
+    SELECT * FROM thresholds
+""").collect()
 
-session.sql(cleaned_train_sql).collect()
+# 3. Create the Training Cleaned Table (<= cutoff_week)
+session.sql(f"""
+    CREATE OR REPLACE TABLE {TRAIN_TABLE_CLEANED} AS
+    SELECT t.*
+    FROM {TRAIN_TABLE_STRUCTURED} t
+    JOIN {temp_thresholds_table} th
+      ON t.{STATS_NTILE_GROUP_COL} = th.{STATS_NTILE_GROUP_COL}
+    WHERE t.{TARGET_COLUMN} IS NOT NULL
+      AND t.CUSTOMER_ID IS NOT NULL
+      AND t.WEEK IS NOT NULL
+      AND t.{TARGET_COLUMN} >= 0
+      AND t.{TARGET_COLUMN} <= (
+          SELECT PERCENTILE_CONT(0.99) WITHIN GROUP (ORDER BY t2.{TARGET_COLUMN})
+          FROM {TRAIN_TABLE_STRUCTURED} t2
+          WHERE t2.{TARGET_COLUMN} IS NOT NULL
+      )
+      AND t.WEEK <= th.cutoff_week
+""").collect()
 
-cleaned_train_count = session.table(TRAIN_TABLE_CLEANED).count()
-print(f"✅ Cleaned training table created: {cleaned_train_count:,} rows")
+# 4. Create the Holdout Dataset (> cutoff_week)
+session.sql(f"""
+    CREATE OR REPLACE TABLE {TRAIN_TABLE_HOLDOUT} AS
+    SELECT t.*
+    FROM {TRAIN_TABLE_STRUCTURED} t
+    JOIN {temp_thresholds_table} th
+      ON t.{STATS_NTILE_GROUP_COL} = th.{STATS_NTILE_GROUP_COL}
+    WHERE t.{TARGET_COLUMN} IS NOT NULL
+      AND t.CUSTOMER_ID IS NOT NULL
+      AND t.WEEK IS NOT NULL
+      AND t.{TARGET_COLUMN} >= 0
+      AND t.{TARGET_COLUMN} <= (
+          SELECT PERCENTILE_CONT(0.99) WITHIN GROUP (ORDER BY t3.{TARGET_COLUMN})
+          FROM {TRAIN_TABLE_STRUCTURED} t3
+          WHERE t3.{TARGET_COLUMN} IS NOT NULL
+      )
+      AND t.WEEK > th.cutoff_week
+""").collect()
 
-# Create cleaned inference table
-print("\n📝 Creating cleaned inference table...")
+cleaned_train_count   = session.table(TRAIN_TABLE_CLEANED).count()
+cleaned_holdout_count = session.table(TRAIN_TABLE_HOLDOUT).count()
+print(f"TRAIN_DATASET_CLEANED: {cleaned_train_count:,} rows (Train {1.0 - HOLDOUT_FRACTION:.0%})")
+print(f"TRAIN_DATASET_HOLDOUT: {cleaned_holdout_count:,} rows (Holdout {HOLDOUT_FRACTION:.0%})")
 
-cleaned_inference_sql = f"""
-CREATE OR REPLACE TABLE {INFERENCE_TABLE_CLEANED} AS
-SELECT *
-FROM {INFERENCE_TABLE_STRUCTURED}
-WHERE CUSTOMER_ID IS NOT NULL
-    AND WEEK IS NOT NULL
-"""
-
-session.sql(cleaned_inference_sql).collect()
-
+session.sql(f"""
+    CREATE OR REPLACE TABLE {INFERENCE_TABLE_CLEANED} AS
+    SELECT *
+    FROM {INFERENCE_TABLE_STRUCTURED}
+    WHERE CUSTOMER_ID IS NOT NULL
+      AND WEEK IS NOT NULL
+""").collect()
 cleaned_inference_count = session.table(INFERENCE_TABLE_CLEANED).count()
-print(f"✅ Cleaned inference table created: {cleaned_inference_count:,} rows")
+print(f"INFERENCE_DATASET_CLEANED: {cleaned_inference_count:,} rows")
 
 # %% [markdown]
-# ## 7. Validate stats_ntile_group Segmentation
+# ## 8. Validate STATS_NTILE_GROUP Segmentation
 
 # %%
-print("\n" + "=" * 80)
-print("🔍 VALIDATING stats_ntile_group SEGMENTATION")
-print("=" * 80)
+if STATS_NTILE_GROUP_COL not in columns:
+    raise ValueError(f"Column '{STATS_NTILE_GROUP_COL}' not found — required for 16-group training")
 
-# Check if STATS_NTILE_GROUP exists
-if STATS_NTILE_GROUP_COL not in columns_upper:
-    print(f"\n❌ ERROR: Column '{STATS_NTILE_GROUP_COL}' NOT found in training dataset!")
-    print("   This column is required for 16-group model training.")
-    raise ValueError(f"{STATS_NTILE_GROUP_COL} column is required")
-
-# Find actual column name (preserving case)
-stats_ntile_col = columns[columns_upper.index(STATS_NTILE_GROUP_COL)]
-
-# Get unique groups
-groups_df = session.sql(
-    f"""
-    SELECT 
-        {stats_ntile_col} AS GROUP_NAME,
-        COUNT(*) AS RECORD_COUNT,
+print("Group distribution:")
+session.sql(f"""
+    SELECT
+        {STATS_NTILE_GROUP_COL} AS GROUP_NAME,
+        COUNT(*)                   AS RECORD_COUNT,
         COUNT(DISTINCT CUSTOMER_ID) AS UNIQUE_CUSTOMERS,
-        AVG({TARGET_COLUMN}) AS AVG_TARGET,
-        MIN({TARGET_COLUMN}) AS MIN_TARGET,
-        MAX({TARGET_COLUMN}) AS MAX_TARGET
+        AVG({TARGET_COLUMN})       AS AVG_TARGET
     FROM {TRAIN_TABLE_CLEANED}
-    WHERE {stats_ntile_col} IS NOT NULL
-    GROUP BY {stats_ntile_col}
-    ORDER BY {stats_ntile_col}
-"""
-)
+    WHERE {STATS_NTILE_GROUP_COL} IS NOT NULL
+    GROUP BY {STATS_NTILE_GROUP_COL}
+    ORDER BY {STATS_NTILE_GROUP_COL}
+""").show()
 
-print("\n📊 Group Distribution:")
-groups_df.show()
+group_count = session.sql(f"""
+    SELECT COUNT(DISTINCT {STATS_NTILE_GROUP_COL}) AS CNT
+    FROM {TRAIN_TABLE_CLEANED}
+    WHERE {STATS_NTILE_GROUP_COL} IS NOT NULL
+""").collect()[0]["CNT"]
 
-# Get group count
-group_count = groups_df.count()
-print(f"\n📊 Total unique groups: {group_count}")
-
-# Validate we have exactly 16 groups
 if group_count != 16:
-    print(f"\n⚠️  WARNING: Expected 16 groups, found {group_count}")
-    print("   This may affect model training. Please verify segmentation logic.")
+    print(f"WARNING: Expected 16 groups, found {group_count}")
 else:
-    print(f"\n✅ Validation passed: Exactly 16 groups found")
+    print(f"Validation passed: {group_count} groups found")
 
-# Check minimum records per group (recommend at least 100)
-min_records_check = session.sql(
-    f"""
-    SELECT 
-        MIN(RECORD_COUNT) AS MIN_RECORDS,
-        MAX(RECORD_COUNT) AS MAX_RECORDS,
-        AVG(RECORD_COUNT) AS AVG_RECORDS
+min_records_result = session.sql(f"""
+    SELECT MIN(RECORD_COUNT) AS MIN_RECORDS, MAX(RECORD_COUNT) AS MAX_RECORDS
     FROM (
-        SELECT 
-            {stats_ntile_col},
-            COUNT(*) AS RECORD_COUNT
+        SELECT {STATS_NTILE_GROUP_COL}, COUNT(*) AS RECORD_COUNT
         FROM {TRAIN_TABLE_CLEANED}
-        WHERE {stats_ntile_col} IS NOT NULL
-        GROUP BY {stats_ntile_col}
+        WHERE {STATS_NTILE_GROUP_COL} IS NOT NULL
+        GROUP BY {STATS_NTILE_GROUP_COL}
     )
-"""
-)
-
-print("\n📊 Records per Group Statistics:")
-min_records_check.show()
-
-min_records_result = min_records_check.collect()[0]
+""").collect()[0]
 min_records = min_records_result["MIN_RECORDS"]
 
 if min_records < 100:
-    print(f"\n⚠️  WARNING: Some groups have less than 100 records (minimum: {min_records})")
-    print("   This may affect model training quality.")
+    print(f"WARNING: Some groups have fewer than 100 records (min: {min_records})")
 else:
-    print(f"\n✅ All groups have sufficient data (minimum: {min_records} records)")
+    print(f"All groups have sufficient data (min: {min_records} records)")
 
 # %% [markdown]
-# ## 8. Summary Statistics
+# ## 9. Summary
 
 # %%
-print("\n" + "=" * 80)
-print("📊 SUMMARY STATISTICS")
-print("=" * 80)
-
-summary = session.sql(
-    f"""
-    SELECT
-        'Training (Original)' AS DATASET,
-        COUNT(*) AS TOTAL_ROWS,
-        COUNT(DISTINCT CUSTOMER_ID) AS UNIQUE_CUSTOMERS,
-        COUNT(DISTINCT WEEK) AS UNIQUE_WEEKS
+print("Dataset comparison:")
+session.sql(f"""
+    SELECT 'Training (Original)'  AS DATASET, COUNT(*) AS TOTAL_ROWS,
+           COUNT(DISTINCT CUSTOMER_ID) AS UNIQUE_CUSTOMERS, COUNT(DISTINCT WEEK) AS UNIQUE_WEEKS
     FROM {TRAIN_TABLE_STRUCTURED}
     UNION ALL
-    SELECT
-        'Training (Cleaned)' AS DATASET,
-        COUNT(*) AS TOTAL_ROWS,
-        COUNT(DISTINCT CUSTOMER_ID) AS UNIQUE_CUSTOMERS,
-        COUNT(DISTINCT WEEK) AS UNIQUE_WEEKS
+    SELECT 'Training (Cleaned)',   COUNT(*), COUNT(DISTINCT CUSTOMER_ID), COUNT(DISTINCT WEEK)
     FROM {TRAIN_TABLE_CLEANED}
     UNION ALL
-    SELECT
-        'Inference (Original)' AS DATASET,
-        COUNT(*) AS TOTAL_ROWS,
-        COUNT(DISTINCT CUSTOMER_ID) AS UNIQUE_CUSTOMERS,
-        COUNT(DISTINCT WEEK) AS UNIQUE_WEEKS
+    SELECT 'Inference (Original)', COUNT(*), COUNT(DISTINCT CUSTOMER_ID), COUNT(DISTINCT WEEK)
     FROM {INFERENCE_TABLE_STRUCTURED}
     UNION ALL
-    SELECT
-        'Inference (Cleaned)' AS DATASET,
-        COUNT(*) AS TOTAL_ROWS,
-        COUNT(DISTINCT CUSTOMER_ID) AS UNIQUE_CUSTOMERS,
-        COUNT(DISTINCT WEEK) AS UNIQUE_WEEKS
+    SELECT 'Inference (Cleaned)',  COUNT(*), COUNT(DISTINCT CUSTOMER_ID), COUNT(DISTINCT WEEK)
     FROM {INFERENCE_TABLE_CLEANED}
-"""
-)
+""").show()
 
-print("\n📊 Dataset Comparison:")
-summary.show()
-
-print("\n" + "=" * 80)
-print("✅ DATA VALIDATION AND CLEANING COMPLETE!")
-print("=" * 80)
-
-print("\n📋 Validation Summary:")
-print(f"   ✅ Training data validated: {cleaned_train_count:,} rows")
-print(f"   ✅ Inference data validated: {cleaned_inference_count:,} rows")
-print(f"   ✅ stats_ntile_group validated: {group_count} groups")
-print(f"   ✅ Minimum records per group: {min_records}")
-
-print("\n📋 Next Steps:")
-print("   1. Review cleaned tables and group distribution")
-print("   2. Run 02_feature_store_setup.py to create Feature Store")
-print("   3. Run 03_hyperparameter_search.py to find optimal hyperparameters per group")
+print("Data validation and cleaning complete.")
+print(f"   Training rows (cleaned {(1-HOLDOUT_FRACTION)*100:.0f}%): {cleaned_train_count:,}")
+print(f"   Holdout rows (cleaned {HOLDOUT_FRACTION*100:.0f}%):  {cleaned_holdout_count:,}")
+print(f"   Inference rows (cleaned):    {cleaned_inference_count:,}")
+print(f"   STATS_NTILE_GROUP groups: {group_count}")
+print(f"   Minimum records per group (Train): {min_records}")
+print("\nNext: 02_feature_store_setup.py")
