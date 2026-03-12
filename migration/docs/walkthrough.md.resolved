@@ -1,0 +1,183 @@
+# MLOps Pipeline — Resumen Panorámico
+
+## Pipeline Flow
+
+```mermaid
+flowchart TD
+    A["01 — Data Validation & Cleaning"] --> B["02 — Feature Materialization"]
+    B --> C["03 / 03b — HPO Random / Bayesian"]
+    C --> D["04 — Many Model Training (16 modelos)"]
+    D --> E["05 — Partitioned Model Registration"]
+    E --> F["06a — Setup & Inference (Baseline)"]
+    F --> G["06b — Data Drift Baseline"]
+    F --> H["06c — Prediction Drift Baseline"]
+    F --> I["06d — Performance Baseline"]
+    G & H & I --> J["07 — Environment Change (DEV → PROD)"]
+    J --> K["08 — Partitioned Inference Batch"]
+    K --> L["09a — Setup Observability"]
+    L --> M["09b — Data Drift"]
+    L --> N["09c — Prediction Drift"]
+    L --> O["09d — Performance Drift"]
+```
+
+---
+
+## Resumen por Script
+
+### 01 — Data Validation & Cleaning
+> Valida y limpia los datasets de entrenamiento e inferencia.
+
+- Verifica estructura, NULLs, outliers, distribución del target `UNI_BOX_WEEK`
+- Cap de outliers al percentil 99
+- Verifica compatibilidad de features entre train e inference
+- **Split temporal**: 90% train → `TRAIN_DATASET_CLEANED`, 10% holdout → `TRAIN_DATASET_HOLDOUT`
+- Limpia inferencia → `INFERENCE_DATASET_CLEANED`
+- Valida 16 grupos en `STATS_NTILE_GROUP`
+
+### 02 — Feature Materialization
+> Materializa features numéricas en una tabla dedicada.
+
+- Lee `TRAIN_DATASET_CLEANED`, excluye columnas metadata/target
+- CTAS → `UNI_BOX_FEATURES` en schema `SC_FEATURES_BMX`
+
+### 03 — Hyperparameter Search (Random)
+> HPO secuencial por grupo usando `RandomSearch` con Ray cluster.
+
+- 16 grupos × 15 trials (LGBM o XGB según mapping predefinido)
+- Split temporal 80/20 dentro de cada grupo
+- Métricas: RMSE, MAE, WAPE, MAPE
+- Resultados → ML Experiments o tabla fallback `HYPERPARAMETER_RESULTS`
+- Escala cluster a 5 nodos, luego baja a 1
+
+### 03b — Hyperparameter Search (Bayesian)
+> Variante bayesiana (`BayesOpt`) del mismo workflow.
+
+- Usa `uniform()` para todos los parámetros (BayesOpt requiere distribuciones continuas)
+- Cast de integers dentro de la función de entrenamiento
+- Mismo mapping grupo→algoritmo, misma estructura de resultados
+
+### 04 — Many Model Training
+> Entrena 16 modelos independientes usando `ManyModelTraining`.
+
+- Carga hiperparámetros de Experiments / tabla fallback
+- Cada grupo entrena su propio modelo (LGBM/XGB)
+- Split temporal 80/20 por grupo
+- Registra cada modelo en Model Registry con alias `PRODUCTION`
+- Métricas guardadas: RMSE, MAE, WAPE, MAPE, hiperparámetros, features
+
+### 05 — Create Partitioned Model
+> Combina los 16 modelos en un `CustomModel` particionado.
+
+- Carga los 16 modelos del Registry (alias `PRODUCTION`)
+- Define [PartitionedUniBoxModel](file:///d:/TRABAJOS/CHAMBA/demo-mlops-snowflake/migration/05_create_partitioned_model.py#88-164) con `@partitioned_api`
+- Rutea predicciones por `STATS_NTILE_GROUP`
+- Registra como `UNI_BOX_REGRESSION_PARTITIONED` (TABLE_FUNCTION)
+- Guarda metadata de sub-modelos y asigna alias `PRODUCTION`
+
+### 06a — Setup Baselines
+> Inferencia del modelo PRODUCTION sobre datos de holdout.
+
+- Crea tablas landing: `DA_PREDICTIONS_BASELINE`, histogramas drift, performance
+- Lookup de categoría de cliente (`TRAIN_CUST_CATEGORY_LOOKUP`)
+- Inferencia particionada por week usando `MODEL()!PREDICT`
+- Crea vista `DA_PREDICTIONS_BASELINE_VW` con categorías
+
+### 06b — Data Drift Baseline
+> Histogramas de referencia para drift de datos.
+
+- **PSI**: proporciones de clientes por segmento (`STATS_NTILE_GROUP`, `CUST_CATEGORY`)
+- **JSD**: histogramas por feature numérica con N_BINS=20 cuantiles
+- Features con ≤2 valores distintos excluidas (dummies)
+- Almacena en `DA_DATA_DRIFT_HISTOGRAMS_BASELINE`
+
+### 06c — Prediction Drift Baseline
+> Histogramas de referencia para drift de predicciones.
+
+- Cuantiles de la columna `PREDICTION` por segmento
+- Mismo esquema de bins que features → `DA_PREDICTION_DRIFT_HISTOGRAMS_BASELINE`
+
+### 06d — Performance Baseline
+> Métricas de rendimiento de referencia.
+
+- Join predicciones baseline con actuals del holdout
+- Métricas: WAPE, RMSE, MAE, F1 (por segmento + `full_model`)
+- Almacena en `DA_PERFORMANCE_BASELINE`
+
+### 07 — Environment Change
+> Migración DEV → PROD del modelo y baselines.
+
+- Copia versión `PRODUCTION` al schema de producción
+- Aplica tag `CANDIDATE_VERSION` para señalar qué versión ejecutar
+- Sincroniza tablas baseline (histogramas, performance) entre schemas
+- Usa `CREATE MODEL ... FROM MODEL` o `ALTER MODEL ADD VERSION`
+
+### 08 — Partitioned Inference Batch
+> Inferencia en producción sobre datos de inferencia.
+
+- Lee versiones candidatas desde tags del modelo (`CANDIDATE_VERSION`)
+- Identifica combos (versión, semana) faltantes en `DA_PREDICTIONS`
+- Ejecuta `MODEL()!PREDICT` particionado por `STATS_NTILE_GROUP` y por semana
+- Crea `DA_PREDICTIONS_VW`, `GROUND_TRUTH_DATASET_STRUCTURED`, `ACTUALS_TABLE_VW`
+
+### 09a — Setup Observability
+> Crea tablas landing para métricas de observabilidad.
+
+- Histogramas: `DA_DATA_DRIFT_HISTOGRAMS`, `DA_PREDICTION_DRIFT_HISTOGRAMS`
+- Drift metrics: `DA_DATA_DRIFT`, `DA_PREDICTION_DRIFT` (con umbrales y nivel de alerta)
+- Performance: `DA_PERFORMANCE` (con drift proporcional)
+
+### 09b — Data Drift
+> Detecta cambios en la distribución de datos de entrada.
+
+| Métrica | Warning | Critical |
+|---------|---------|----------|
+| PSI | > 0.1 | > 0.2 |
+| Jensen-Shannon Distance | > 0.2 | > 0.45 |
+
+- PSI: compara proporciones de segmentos producción vs baseline
+- JSD: reutiliza bin edges del baseline, calcula histogramas de producción, luego `sqrt(0.5*KL(P||M) + 0.5*KL(Q||M))`
+
+### 09c — Prediction Drift
+> Detecta cambios en la distribución de predicciones.
+
+- Mismo esquema JSD pero aplicado a la columna `PREDICTION`
+- Thresholds: JSD > 0.2 warning, > 0.45 critical
+- Reutiliza bin edges de `DA_PREDICTION_DRIFT_HISTOGRAMS_BASELINE`
+
+### 09d — Performance Drift
+> Compara métricas de rendimiento producción vs baseline.
+
+| Métrica | Warning | Critical | Dirección |
+|---------|---------|----------|-----------|
+| WAPE | +20% | +50% | higher = worse |
+| RMSE | +20% | +50% | higher = worse |
+| MAE | +20% | +50% | higher = worse |
+| F1 | -15% | -30% | lower = worse |
+
+- Join predicciones con actuals (`ACTUALS_TABLE_VW`)
+- `METRIC_DRIFT = (prod - baseline) / |baseline|`
+- Verificación final: conteo de todas las landing tables
+
+---
+
+## Inventario de Tablas
+
+| Tabla | Schema | Creada por |
+|-------|--------|------------|
+| `TRAIN_DATASET_CLEANED` | `SC_STORAGE_BMX_PS` | 01 |
+| `TRAIN_DATASET_HOLDOUT` | `SC_STORAGE_BMX_PS` | 01 |
+| `INFERENCE_DATASET_CLEANED` | `SC_STORAGE_BMX_PS` | 01 |
+| `UNI_BOX_FEATURES` | `SC_FEATURES_BMX` | 02 |
+| `HYPERPARAMETER_RESULTS` | `SC_MODELS_BMX` | 03/03b |
+| `uni_box_regression_<group>` (×16) | `SC_MODELS_BMX` | 04 |
+| `UNI_BOX_REGRESSION_PARTITIONED` | `SC_MODELS_BMX` | 05 |
+| `DA_PREDICTIONS_BASELINE` | `SC_STORAGE_BMX_PS` | 06a |
+| `DA_DATA_DRIFT_HISTOGRAMS_BASELINE` | `SC_STORAGE_BMX_PS` | 06b |
+| `DA_PREDICTION_DRIFT_HISTOGRAMS_BASELINE` | `SC_STORAGE_BMX_PS` | 06c |
+| `DA_PERFORMANCE_BASELINE` | `SC_STORAGE_BMX_PS` | 06d |
+| `DA_PREDICTIONS` | `SC_FEATURES_BMX` | 08 |
+| `DA_DATA_DRIFT_HISTOGRAMS` | `SC_FEATURES_BMX` | 09a/09b |
+| `DA_DATA_DRIFT` | `SC_FEATURES_BMX` | 09b |
+| `DA_PREDICTION_DRIFT_HISTOGRAMS` | `SC_FEATURES_BMX` | 09a/09c |
+| `DA_PREDICTION_DRIFT` | `SC_FEATURES_BMX` | 09c |
+| `DA_PERFORMANCE` | `SC_FEATURES_BMX` | 09d |

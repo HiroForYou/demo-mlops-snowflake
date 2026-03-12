@@ -64,7 +64,7 @@ def convert_py_to_notebook(py_file_path, output_notebook_path):
             if line.startswith('# '):
                 content = line[2:]
                 current_cell.append(content)
-                if not current_cell_name and content.startswith(('# ', '## ')):
+                if not current_cell_name and content.startswith(('# ', '## ', '### ', '#### ')):
                     # Limpiamos los hashes para obtener el nombre limpio
                     clean_name = content.lstrip('#').strip()
                     if clean_name:
@@ -161,15 +161,13 @@ scripts = [
     '03b_hyperparameter_search_bayesian.py',
     '04_many_model_training.py',
     '05_create_partitioned_model.py',
-    '06_create_baselines.py',
-    '06a_setup_and_inference.py',
+    '06a_setup_baselines.py',
     '06b_data_drift_baseline.py',
     '06c_prediction_drift_baseline.py',
     '06d_performance_drift_baseline.py',
     '07_environment_change.py',
     '08_partitioned_inference_batch.py',
-    '09_ml_observability.py',
-    '09a_setup.py',
+    '09a_setup_observability.py',
     '09b_data_drift.py',
     '09c_prediction_drift.py',
     '09d_performance_drift.py'
