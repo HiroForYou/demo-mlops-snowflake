@@ -38,22 +38,21 @@ SRC_STORAGE_SCHEMA = "SC_STORAGE_BMX_PS"
 session.sql(f"USE DATABASE {DATABASE}").collect()
 session.sql(f"USE SCHEMA {STORAGE_SCHEMA}").collect()
 
+# Model name (base for all derived objects)
+MODEL_NAME = "UNIBOX_CUSTBPR_WEEKLY_FORECAST"
+
 # Auxiliary setup tables/views
-INFERENCE_DATASET_CLEANED = "INFERENCE_DATASET_CLEANED"
+INFERENCE_DATASET_CLEANED = f"{DATABASE}.{FEATURES_SCHEMA}.FEAT_{MODEL_NAME}__INF"
 INFERENCE_CUST_CATEGORY_LOOKUP = "INFERENCE_CUST_CATEGORY_LOOKUP"
-DA_PREDICTIONS_VW = "DA_PREDICTIONS_VW"
+DA_PREDICTIONS_VW = f"OBS_{MODEL_NAME}__PRED_VW"
 GROUND_TRUTH_DATASET_STRUCTURED = "GROUND_TRUTH_DATASET_STRUCTURED"
 ACTUALS_TABLE_VW = "ACTUALS_TABLE_VW"
 
 # Input data source (inference dataset)
-SOURCE_TABLE = "INFERENCE_DATASET_CLEANED_VW"
-FEATURE_TABLE = f"{DATABASE}.{FEATURES_SCHEMA}.INFERENCE_DATASET_CLEANED_VW"
+FEATURE_TABLE = f"{DATABASE}.{FEATURES_SCHEMA}.FEAT_{MODEL_NAME}__INF_VW"
 
 # Landing location
-PREDICTION_TABLE = "DA_PREDICTIONS"
-
-# Model specifics
-MODEL_NAME = "UNI_BOX_REGRESSION_PARTITIONED"
+PREDICTION_TABLE = f"OBS_{MODEL_NAME}__PRED"
 MODEL_FQN = f"{DATABASE}.{MODELS_SCHEMA}.{MODEL_NAME}"
 
 # Tags whose values identify model versions to run inference for.
@@ -417,7 +416,7 @@ except Exception as e:
     print("   To find them in Snowflake:")
     print("   1. Go to the Model Registry in Snowsight.")
     print("   2. Open the model:")
-    print("      BD_AA_DEV.SC_MODELS_BMX.UNI_BOX_REGRESSION_PARTITIONED")
+    print("      BD_AA_DEV.SC_MODELS_BMX.UNIBOX_CUSTBPR_WEEKLY_FORECAST")
     print("   3. Select the version you are trying to load.")
     print("   4. Download the model artifacts.")
     print("   5. Open the file:")

@@ -30,16 +30,21 @@ DATABASE        = "BD_AA_DEV"
 STORAGE_SCHEMA  = "SC_STORAGE_BMX_PS"
 FEATURES_SCHEMA = "SC_FEATURES_BMX"
 MODELS_SCHEMA   = "SC_MODELS_BMX"
-TRAIN_TABLE_CLEANED         = f"{DATABASE}.{STORAGE_SCHEMA}.TRAIN_DATASET_CLEANED"
-FEATURES_TABLE              = f"{DATABASE}.{FEATURES_SCHEMA}.UNI_BOX_FEATURES"
-HYPERPARAMETER_RESULTS_TABLE = f"{DATABASE}.{MODELS_SCHEMA}.HYPERPARAMETER_RESULTS"
+
+# Model name (base for all derived objects)
+MODEL_NAME = "UNIBOX_CUSTBPR_WEEKLY_FORECAST"
+
+# Input tables
+TRAIN_TABLE_CLEANED         = f"{DATABASE}.{FEATURES_SCHEMA}.FEAT_{MODEL_NAME}__TRAIN"
+FEATURES_TABLE              = f"{DATABASE}.{FEATURES_SCHEMA}.FEAT_{MODEL_NAME}"
+HYPERPARAMETER_RESULTS_TABLE = f"{DATABASE}.{MODELS_SCHEMA}.HPO_{MODEL_NAME}"
 MMT_STAGE                   = f"{DATABASE}.{MODELS_SCHEMA}.MMT_MODELS"
 
 TARGET_COLUMN         = "UNI_BOX_WEEK"
 STATS_NTILE_GROUP_COL = "STATS_NTILE_GROUP"
 VERSION_DATE          = datetime.now().strftime("%Y%m%d_%H%M")
 EXPERIMENT_DATE       = datetime.now().strftime("%Y%m%d")
-EXPERIMENT_NAME       = f"hyperparameter_search_bayesian_{EXPERIMENT_DATE}"
+EXPERIMENT_NAME       = f"EXP_{MODEL_NAME}_BAYESIAN_{EXPERIMENT_DATE}"
 
 # Metadata columns excluded from the feature set
 EXCLUDED_COLS = [
@@ -482,7 +487,7 @@ for pid, details in partition_details.items():
         continue
     try:
         model       = training_run.get_model(pid)
-        model_name  = f"uni_box_regression_{pid.lower()}"
+        model_name  = f"{MODEL_NAME.lower()}__{pid.lower()}"
         group_hp    = hyperparams_by_group.get(pid, {})
         group_alg   = group_hp.get("algorithm") or GROUP_MODEL.get(pid, _DEFAULT_MODEL)
         group_sid   = group_hp.get("search_id", "default")

@@ -3,7 +3,7 @@
 #
 # Loads the 16 group-specific models from the Model Registry (PRODUCTION alias),
 # wraps them in a CustomModel with the partitioned API, and registers the
-# combined model as UNI_BOX_REGRESSION_PARTITIONED.
+# combined model as UNIBOX_CUSTBPR_WEEKLY_FORECAST.
 
 # %% [markdown]
 # ## 1. Setup
@@ -25,9 +25,15 @@ session = get_active_session()
 # %%
 DATABASE        = "BD_AA_DEV"
 STORAGE_SCHEMA  = "SC_STORAGE_BMX_PS"
+FEATURES_SCHEMA = "SC_FEATURES_BMX"
 MODELS_SCHEMA   = "SC_MODELS_BMX"
-TRAIN_TABLE_CLEANED   = f"{DATABASE}.{STORAGE_SCHEMA}.TRAIN_DATASET_CLEANED"
-PARTITIONED_MODEL_NAME = "UNI_BOX_REGRESSION_PARTITIONED"
+
+# Model name (base for all derived objects)
+MODEL_NAME = "UNIBOX_CUSTBPR_WEEKLY_FORECAST"
+
+# Input tables
+TRAIN_TABLE_CLEANED   = f"{DATABASE}.{FEATURES_SCHEMA}.FEAT_{MODEL_NAME}__TRAIN"
+PARTITIONED_MODEL_NAME = MODEL_NAME
 VERSION_DATE           = datetime.now().strftime("%Y%m%d_%H%M")
 
 STATS_NTILE_GROUP_COL = "STATS_NTILE_GROUP"
@@ -62,7 +68,7 @@ loaded_models = {}
 feature_cols  = None
 
 for group_name in groups_list:
-    model_name = f"uni_box_regression_{group_name.lower()}"
+    model_name = f"{MODEL_NAME.lower()}__{group_name.lower()}"
     try:
         model_ref    = registry.get_model(model_name)
         model_version = model_ref.version("PRODUCTION")

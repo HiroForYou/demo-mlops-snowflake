@@ -139,8 +139,10 @@ diferentes cortes del mismo dataset según el caso de uso (train, inferencia, ho
 ```
 SC_FEATURES_BMX
 ├── FEAT_UNIBOX_CUSTBPR_WEEKLY_FORECAST              ← tabla materializada de features
+├── FEAT_UNIBOX_CUSTBPR_WEEKLY_FORECAST__TRAIN       ← tabla: features + target (entrenamiento)
 ├── FEAT_UNIBOX_CUSTBPR_WEEKLY_FORECAST__TRAIN_VW    ← vista: features + target (entrenamiento)
 ├── FEAT_UNIBOX_CUSTBPR_WEEKLY_FORECAST__INF_VW      ← vista: features sin target (inferencia)
+├── FEAT_UNIBOX_CUSTBPR_WEEKLY_FORECAST__HOLDOUT      ← tabla: holdout temporal (baselines)
 └── FEAT_UNIBOX_CUSTBPR_WEEKLY_FORECAST__HOLDOUT_VW  ← vista: holdout temporal (baselines)
 ```
 
@@ -166,9 +168,40 @@ compartida mediante JOINs o vistas, manteniendo la interfaz `FEAT_<model>__*_VW`
 
 ---
 
-## 3. Observability Tables
+## 3. ML Experiment Names
 
 ### 3.1 Pattern
+
+Los experimentos de ML (usados en hyperparameter search y model tracking) siguen
+una nomenclatura que identifica el modelo, el tipo de búsqueda y la fecha:
+
+```
+EXP_<model>_<search_type>_<YYYYMMDD>
+```
+
+| Dimensión | ¿Qué describe? | Códigos/Ejemplos |
+|-----------|-----------------|------------------|
+| **model** | Nombre del modelo (mismo que en Model Registry) | `UNIBOX_CUSTBPR_WEEKLY_FORECAST` |
+| **search_type** | Tipo de búsqueda de hiperparámetros | `RANDOM`, `BAYESIAN`, `GRID` |
+| **YYYYMMDD** | Fecha de inicio del experimento | `20260317` |
+
+### 3.2 Ejemplos
+
+| Nombre actual | Nombre propuesto | Descripción |
+|---|---|---|
+| `hyperparameter_search_regression_20260317` | `EXP_UNIBOX_CUSTBPR_WEEKLY_FORECAST_RANDOM_20260317` | Búsqueda aleatoria de hiperparámetros |
+| `hyperparameter_search_bayesian_20260317` | `EXP_UNIBOX_CUSTBPR_WEEKLY_FORECAST_BAYESIAN_20260317` | Búsqueda bayesiana de hiperparámetros |
+
+> [!TIP]
+> El sufijo de fecha permite múltiples ejecuciones del mismo experimento en
+> diferentes días sin conflictos de nombres. Los experimentos son inmutables
+> una vez creados, por lo que cada nueva iteración requiere un nuevo nombre.
+
+---
+
+## 4. Observability Tables
+
+### 4.1 Pattern
 
 ```
 OBS_<model>__<metric_type>
@@ -191,12 +224,12 @@ manteniendo consistencia con la convención de vistas del feature store.
 
 ---
 
-## 4. Vocabulary Registry
+## 5. Vocabulary Registry
 
 Tabla de referencia centralizada. **Agregar nuevos códigos aquí antes de
 registrar un modelo nuevo** para garantizar unicidad y consistencia.
 
-### 4.1 Targets (variable predictora)
+### 5.1 Targets (variable predictora)
 
 | Código | Nombre completo | Descripción |
 |--------|-----------------|-------------|
@@ -204,7 +237,7 @@ registrar un modelo nuevo** para garantizar unicidad y consistencia.
 | `PROB` | Probability | Probabilidad de evento |
 | `OOS` | Out-of-stock | Indicador de desabasto |
 
-### 4.2 Entities (nivel de granularidad)
+### 5.2 Entities (nivel de granularidad)
 
 | Código | Nombre completo | Descripción |
 |--------|-----------------|-------------|
@@ -213,7 +246,7 @@ registrar un modelo nuevo** para garantizar unicidad y consistencia.
 | `STORE` | Store | Nivel tienda |
 | `SKU` | SKU | Nivel SKU individual |
 
-### 4.3 Frequencies (granularidad temporal)
+### 5.3 Frequencies (granularidad temporal)
 
 | Código | Nombre completo |
 |--------|-----------------|
@@ -221,7 +254,7 @@ registrar un modelo nuevo** para garantizar unicidad y consistencia.
 | `WEEKLY` | Weekly (semanal) |
 | `MONTHLY` | Monthly (mensual) |
 
-### 4.4 Methods (tipo de modelo)
+### 5.4 Methods (tipo de modelo)
 
 | Código | Nombre completo | Descripción |
 |--------|-----------------|-------------|
@@ -229,6 +262,15 @@ registrar un modelo nuevo** para garantizar unicidad y consistencia.
 | `REGRESS` | Regression | Regresión estadística / ML |
 | `CLASSIF` | Classification | Clasificación binaria o multiclase |
 | `RANKING` | Ranking | Modelos de recomendación |
+
+### 5.5 Search Types (tipo de búsqueda HPO)
+
+| Código | Nombre completo | Descripción |
+|--------|-----------------|-------------|
+| `RANDOM` | Random Search | Búsqueda aleatoria de hiperparámetros |
+| `BAYESIAN` | Bayesian Optimization | Optimización bayesiana (BO/TPE) |
+| `GRID` | Grid Search | Búsqueda exhaustiva en grilla |
+| `GENETIC` | Genetic Algorithm | Algoritmo genético |
 
 > [!NOTE]
 > Si un nuevo modelo no encaja en las dimensiones existentes, primero se

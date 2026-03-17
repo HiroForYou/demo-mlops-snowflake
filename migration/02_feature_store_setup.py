@@ -5,7 +5,7 @@
 # plain Snowflake table.  Steps performed:
 # 1. Ensure the destination schema exists.
 # 2. Build the feature query (all columns except identifiers and target).
-# 3. Materialize features into UNI_BOX_FEATURES (CTAS / overwrite).
+# 3. Materialize features into FEAT_UNIBOX_CUSTBPR_WEEKLY_FORECAST (CTAS / overwrite).
 
 # %% [markdown]
 # ## 1. Setup
@@ -22,8 +22,13 @@ session = get_active_session()
 DATABASE        = "BD_AA_DEV"
 STORAGE_SCHEMA  = "SC_STORAGE_BMX_PS"
 FEATURES_SCHEMA = "SC_FEATURES_BMX"
-TRAIN_TABLE_CLEANED = f"{DATABASE}.{STORAGE_SCHEMA}.TRAIN_DATASET_CLEANED"
-FEATURES_TABLE      = f"{DATABASE}.{FEATURES_SCHEMA}.UNI_BOX_FEATURES"
+
+# Model name (base for all derived objects)
+MODEL_NAME = "UNIBOX_CUSTBPR_WEEKLY_FORECAST"
+
+# Input and output tables
+TRAIN_TABLE_CLEANED = f"{DATABASE}.{FEATURES_SCHEMA}.FEAT_{MODEL_NAME}__TRAIN"
+FEATURES_TABLE      = f"{DATABASE}.{FEATURES_SCHEMA}.FEAT_{MODEL_NAME}"
 
 TARGET_COLUMN       = "UNI_BOX_WEEK"
 STATS_NTILE_GROUP_COL = "STATS_NTILE_GROUP"
