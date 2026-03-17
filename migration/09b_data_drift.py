@@ -29,19 +29,22 @@ FEATURES_SCHEMA = "SC_FEATURES_BMX"
 session.sql(f"USE DATABASE {DATABASE}").collect()
 session.sql(f"USE SCHEMA {STORAGE_SCHEMA}").collect()
 
-# Model name (base for all derived objects)
+# Model name (base for all model-specific objects)
 MODEL_NAME = "UNIBOX_CUSTBPR_WEEKLY_FORECAST"
 
+# Feature store name (shared by entity and frequency, not tied to model)
+FEATURE_STORE_NAME = "FEAT_CUSTBPR_WEEKLY"
+
 # Input data sources
-FEATURE_TABLE = f"{DATABASE}.{FEATURES_SCHEMA}.FEAT_{MODEL_NAME}__INF_VW"
-PREDICTION_TABLE = f"OBS_{MODEL_NAME}__PRED_VW"
+FEATURE_TABLE = f"{DATABASE}.{FEATURES_SCHEMA}.{FEATURE_STORE_NAME}__INF_VW"
+PREDICTION_TABLE = "OBS_PREDICTIONS_VW"
 
-# Baseline tables (read-only)
-DATA_DRIFT_HISTOGRAMS_BASELINE = f"OBS_{MODEL_NAME}__DATA_HIST_BL"
+# Baseline tables (read-only - generic, shared across models)
+DATA_DRIFT_HISTOGRAMS_BASELINE = "OBS_DATA_HIST_BL"
 
-# Landing tables
-DATA_DRIFT_HISTOGRAMS = f"OBS_{MODEL_NAME}__DATA_HIST"
-DATA_DRIFT = f"OBS_{MODEL_NAME}__DATA_DRIFT"
+# Landing tables (generic, shared across models)
+DATA_DRIFT_HISTOGRAMS = "OBS_DATA_HIST"
+DATA_DRIFT = "OBS_DATA_DRIFT"
 AGG_COLS = ["STATS_NTILE_GROUP", "CUST_CATEGORY"]
 TIME_COL = "week"
 

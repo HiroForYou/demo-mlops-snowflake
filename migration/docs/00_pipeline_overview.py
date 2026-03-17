@@ -210,13 +210,13 @@ registry.log_model(partitioned_model,
 # Objetivo: Ejecutar inferencia del modelo PRODUCTION sobre datos de holdout
 #           para crear baseline de predicciones.
 
-# Crea tablas: DA_PREDICTIONS_BASELINE, histogramas, performance
+# Crea tablas: OBS_PREDICTIONS_BL, histogramas, performance
 # Lookup de categoría de cliente (pharm_super_conv, wines_liquor, etc.)
 # Vista: TRAIN_DATASET_HOLDOUT_VW con cust_category
 
 # Inferencia particionada batch por semana:
 """
-INSERT INTO DA_PREDICTIONS_BASELINE
+INSERT INTO OBS_PREDICTIONS_BL
 SELECT
     SHA2(...) AS RECORD_ID,
     OBJECT_CONSTRUCT('customer_id', p.customer_id, 'week', p.week, ...) AS ENTITY_MAP,
@@ -227,7 +227,7 @@ TABLE(MODEL(UNI_BOX_REGRESSION_PARTITIONED, version)!PREDICT(
 ) OVER (PARTITION BY t.STATS_NTILE_GROUP)) p
 """
 
-# Crea DA_PREDICTIONS_BASELINE_VW con categorías de cliente
+# Crea OBS_PREDICTIONS_BL_VW con categorías de cliente
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -242,7 +242,7 @@ proportions = (src_tbl
     .agg(count().alias("N_ROWS"))
     .with_column("PROPORTION", N_ROWS / sum(N_ROWS).over(partition_by(TIME_COL)))
 )
-# → DA_DATA_DRIFT_HISTOGRAMS_BASELINE (metric_col = "population_stability_index")
+# → OBS_DATA_HIST_BL (metric_col = "population_stability_index")
 
 # --- JSD (Jensen-Shannon Distance) ---
 # Histogramas por feature numérica: 20 cuantiles para high-cardinality,
@@ -250,7 +250,7 @@ proportions = (src_tbl
 bins, features = get_feature_bin_edges(src_tbl, agg_col)
 
 # Unpivot → join bins → count per bin → scaffold empty bins
-# → DA_DATA_DRIFT_HISTOGRAMS_BASELINE (metric_col = "jensen-shannon")
+# → OBS_DATA_HIST_BL (metric_col = "jensen-shannon")
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -259,7 +259,7 @@ bins, features = get_feature_bin_edges(src_tbl, agg_col)
 # Objetivo: Histogramas de referencia de la distribución de predicciones.
 
 bins = get_prediction_bin_edges(src_tbl, agg_col)  # 20 cuantiles sobre PREDICTION
-# Binning → scaffold → DA_PREDICTION_DRIFT_HISTOGRAMS_BASELINE
+# Binning → scaffold → OBS_PRED_HIST_BL
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -275,8 +275,8 @@ def compute_performance_metrics(paired_df, agg_col):
     # Calcula por segmento + "full_model"
     ...
 
-# Join DA_PREDICTIONS_BASELINE_VW con TRAIN_DATASET_HOLDOUT_VW
-# → DA_PERFORMANCE_BASELINE
+# Join OBS_PREDICTIONS_BL_VW con FEAT_CUSTBPR_WEEKLY__HOLDOUT_VW
+# → OBS_PERFORMANCE_BL
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -313,10 +313,10 @@ for src_tbl, tgt_tbl in baseline_pairs:
 all_tags = model_ref.show_tags()
 versions_to_run = [tag_value for tag in MODEL_TAGS if active]
 
-# Identifica combos (version, week) faltantes en DA_PREDICTIONS
+# Identifica combos (version, week) faltantes en OBS_PREDICTIONS
 existing_combos = set(
     (row["MODEL_VERSION"], row["ENTITY_TIME"])
-    for row in session.table("DA_PREDICTIONS")
+    for row in session.table("OBS_PREDICTIONS")
         .select("MODEL_VERSION", F.col("ENTITY_MAP")[TIME_COL].alias("ENTITY_TIME"))
         .distinct().collect()
 )
@@ -329,7 +329,7 @@ for version, missing_weeks in combos_needed.items():
         batch_df.create_or_replace_temp_view("BATCH_PAGE")
         session.sql(insert_batch_sql).collect()  # MODEL()!PREDICT particionado
 
-# Post-inference: crea DA_PREDICTIONS_VW, ACTUALS_TABLE_VW
+# Post-inference: crea OBS_PREDICTIONS_VW, ACTUALS_TABLE_VW
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -337,9 +337,9 @@ for version, missing_weeks in combos_needed.items():
 # ═══════════════════════════════════════════════════════════════════════
 # Objetivo: Crear las tablas landing para las métricas de observabilidad.
 
-# DA_DATA_DRIFT_HISTOGRAMS, DA_PREDICTION_DRIFT_HISTOGRAMS (mismo schema que baseline)
-# DA_DATA_DRIFT, DA_PREDICTION_DRIFT → con WARNING_THRESHOLD, CRITICAL_THRESHOLD, ALERT_LEVEL
-# DA_PERFORMANCE → con METRIC_DRIFT, WARNING_THRESHOLD, CRITICAL_THRESHOLD, ALERT_LEVEL
+# OBS_DATA_HIST, OBS_PRED_HIST (mismo schema que baseline)
+# OBS_DATA_DRIFT, OBS_PRED_DRIFT → con WARNING_THRESHOLD, CRITICAL_THRESHOLD, ALERT_LEVEL
+# OBS_PERFORMANCE → con METRIC_DRIFT, WARNING_THRESHOLD, CRITICAL_THRESHOLD, ALERT_LEVEL
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -351,13 +351,13 @@ for version, missing_weeks in combos_needed.items():
 # Proporciones producción por segmento → compara vs baseline promedio
 # psi_component = (inf_prop - base_prop) * ln(inf_prop / base_prop)
 # PSI = sum(psi_components)
-# Thresholds: > 0.1 warning, > 0.2 critical → DA_DATA_DRIFT
+# Thresholds: > 0.1 warning, > 0.2 critical → OBS_DATA_DRIFT
 
 # --- JSD por feature ---
 # Reutiliza bin edges del baseline → histogramas de producción
 # P = baseline probs, Q = inference probs, M = (P+Q)/2
 # JSD = sqrt(0.5 * KL(P||M) + 0.5 * KL(Q||M))
-# Thresholds: > 0.2 warning, > 0.45 critical → DA_DATA_DRIFT
+# Thresholds: > 0.2 warning, > 0.45 critical → OBS_DATA_DRIFT
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -365,9 +365,9 @@ for version, missing_weeks in combos_needed.items():
 # ═══════════════════════════════════════════════════════════════════════
 # Objetivo: Detectar cambios en la distribución de predicciones.
 
-# Reutiliza bin edges de DA_PREDICTION_DRIFT_HISTOGRAMS_BASELINE
+# Reutiliza bin edges de OBS_PRED_HIST_BL
 # Histogramas producción → JSD vs baseline
-# Thresholds: > 0.2 warning, > 0.45 critical → DA_PREDICTION_DRIFT
+# Thresholds: > 0.2 warning, > 0.45 critical → OBS_PRED_DRIFT
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -375,7 +375,7 @@ for version, missing_weeks in combos_needed.items():
 # ═══════════════════════════════════════════════════════════════════════
 # Objetivo: Comparar métricas de rendimiento producción vs baseline.
 
-# Join predicciones (DA_PREDICTIONS_VW) con actuals (ACTUALS_TABLE_VW)
+# Join predicciones (OBS_PREDICTIONS_VW) con actuals (ACTUALS_TABLE_VW)
 # Calcula WAPE, RMSE, MAE, F1 por segmento + full_model
 # Drift proporcional: (producción - baseline) / |baseline|
 
@@ -386,10 +386,10 @@ PERF_THRESHOLDS = {
     "f1_binary": {"warn": -0.15, "crit": -0.30},  # -15% / -30% = worse
 }
 
-# ALERT_LEVEL: 0 = OK, 1 = warning, 2 = critical → DA_PERFORMANCE
+# ALERT_LEVEL: 0 = OK, 1 = warning, 2 = critical → OBS_PERFORMANCE
 
 # === Verificación final ===
 # Conteo de todas las landing tables:
-# DA_DATA_DRIFT_HISTOGRAMS, DA_DATA_DRIFT,
-# DA_PREDICTION_DRIFT_HISTOGRAMS, DA_PREDICTION_DRIFT,
-# DA_PERFORMANCE
+# OBS_DATA_HIST, OBS_DATA_DRIFT,
+# OBS_PRED_HIST, OBS_PRED_DRIFT,
+# OBS_PERFORMANCE

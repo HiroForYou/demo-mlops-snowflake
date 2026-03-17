@@ -4,7 +4,7 @@
 # Part 1 of the baseline generation pipeline.
 # Initialises the Snowpark session, creates auxiliary objects and target tables,
 # and runs partitioned inference on the training data.
-# Results are stored in DA_PREDICTIONS_BASELINE and DA_PREDICTIONS_BASELINE_VW,
+# Results are stored in OBS_PREDICTIONS_BL and OBS_PREDICTIONS_BL_VW,
 # which are required by the subsequent subscripts (06b, 06c, 06d).
 
 # %% [markdown]
@@ -37,21 +37,24 @@ MODELS_SCHEMA = "SC_MODELS_BMX"
 session.sql(f"USE DATABASE {DATABASE}").collect()
 session.sql(f"USE SCHEMA {STORAGE_SCHEMA}").collect()
 
-# Model name (base for all derived objects)
+# Model name (base for all model-specific objects)
 MODEL_NAME = "UNIBOX_CUSTBPR_WEEKLY_FORECAST"
 
-# Input data sources
-FEATURE_TABLE = f"{DATABASE}.{FEATURES_SCHEMA}.FEAT_{MODEL_NAME}__HOLDOUT_VW"
+# Feature store name (shared by entity and frequency, not tied to model)
+FEATURE_STORE_NAME = "FEAT_CUSTBPR_WEEKLY"
 
-# Target tables (baseline only)
-DATA_DRIFT_HISTOGRAMS_BASELINE = f"OBS_{MODEL_NAME}__DATA_HIST_BL"
-PRED_BASELINE = f"OBS_{MODEL_NAME}__PRED_BL"
-PRED_BASELINE_VW = f"OBS_{MODEL_NAME}__PRED_BL_VW"
-PRED_DRIFT_HISTOGRAMS_BASELINE = f"OBS_{MODEL_NAME}__PRED_HIST_BL"
-PERF_BASELINE = f"OBS_{MODEL_NAME}__PERF_BL"
+# Input data sources
+FEATURE_TABLE = f"{DATABASE}.{FEATURES_SCHEMA}.{FEATURE_STORE_NAME}__HOLDOUT_VW"
+
+# Target tables (baseline only - generic, shared across models)
+DATA_DRIFT_HISTOGRAMS_BASELINE = "OBS_DATA_HIST_BL"
+PRED_BASELINE = "OBS_PREDICTIONS_BL"
+PRED_BASELINE_VW = "OBS_PREDICTIONS_BL_VW"
+PRED_DRIFT_HISTOGRAMS_BASELINE = "OBS_PRED_HIST_BL"
+PERF_BASELINE = "OBS_PERFORMANCE_BL"
 
 # Auxiliary setup tables/views
-TRAIN_DATASET_HOLDOUT = f"{DATABASE}.{FEATURES_SCHEMA}.FEAT_{MODEL_NAME}__HOLDOUT"
+TRAIN_DATASET_HOLDOUT = f"{DATABASE}.{FEATURES_SCHEMA}.{FEATURE_STORE_NAME}__HOLDOUT"
 TRAIN_CUST_CATEGORY_LOOKUP = "TRAIN_CUST_CATEGORY_LOOKUP"
 ID_COLS = ["customer_id", "brand_pres_ret", "prod_key"]
 AGG_COLS = ["STATS_NTILE_GROUP", "CUST_CATEGORY"]
@@ -187,7 +190,7 @@ print("Target tables ready.")
 # ## 2. Inference on training data
 #
 # Partitioned inference of the PRODUCTION model is executed on the training data.
-# The resulting predictions are stored in DA_PREDICTIONS_BASELINE and serve as
+# The resulting predictions are stored in OBS_PREDICTIONS_BL and serve as
 # a reference for calculating prediction histograms and baseline performance metrics.
 
 # %%
@@ -216,7 +219,7 @@ print(f"Needs baseline: {needs_baseline}")
 # ### 2A. Run partitioned inference for new versions
 #
 # Executes partitioned inference by STATS_NTILE_GROUP using MODEL()!PREDICT
-# over each week (WEEK) value. Predictions are inserted into DA_PREDICTIONS_BASELINE
+# over each week (WEEK) value. Predictions are inserted into OBS_PREDICTIONS_BL
 # in batches. Inference is skipped if the version already exists in the table.
 
 # %%

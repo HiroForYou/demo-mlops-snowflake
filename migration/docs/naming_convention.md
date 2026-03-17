@@ -114,21 +114,27 @@ BD_AA_PRD (producción)
 
 ## 2. Feature Store Naming
 
-### 2.1 Strategy: 1 Feature Store per Model (1:1)
+### 2.1 Strategy: Shared Feature Store (Entity-Based)
 
-Dado que cada modelo tiene su propio pipeline de feature engineering con
-transformaciones específicas, la relación **1:1** es el punto de partida recomendado.
-Esto simplifica la trazabilidad y evita dependencias entre modelos.
+El feature store se organiza por **entidad y frecuencia**, no por modelo. Esto permite
+que múltiples modelos compartan las mismas features, reduciendo duplicación y
+facilitando el mantenimiento.
 
 ### 2.2 Pattern
 
 ```
-FEAT_<model_name>
+FEAT_<entity>_<frequency>
 ```
 
-| Databricks (actual) | Snowflake (propuesto) |
+| Componente | ¿Qué describe? | Ejemplos |
+|-----------|-----------------|----------|
+| **entity** | Nivel/granularidad de la entidad | `CUSTBPR` (customer×BPR), `CUSTPROD`, `STORE` |
+| **frequency** | Granularidad temporal | `WEEKLY`, `MONTHLY`, `DAILY` |
+
+| Nombre antiguo (1:1 con modelo) | Nombre nuevo (compartido) |
 |---|---|
-| `UNI_BOX_FEATURES` | `FEAT_UNIBOX_CUSTBPR_WEEKLY_FORECAST` |
+| `FEAT_UNIBOX_CUSTBPR_WEEKLY_FORECAST` | `FEAT_CUSTBPR_WEEKLY` |
+| `FEAT_PROB_CUSTPROD_MONTHLY_CLASSIF` | `FEAT_CUSTPROD_MONTHLY` |
 
 
 ### 2.3 Schema & Table Layout
@@ -138,33 +144,33 @@ diferentes cortes del mismo dataset según el caso de uso (train, inferencia, ho
 
 ```
 SC_FEATURES_BMX
-├── FEAT_UNIBOX_CUSTBPR_WEEKLY_FORECAST              ← tabla materializada de features
-├── FEAT_UNIBOX_CUSTBPR_WEEKLY_FORECAST__TRAIN       ← tabla: features + target (entrenamiento)
-├── FEAT_UNIBOX_CUSTBPR_WEEKLY_FORECAST__TRAIN_VW    ← vista: features + target (entrenamiento)
-├── FEAT_UNIBOX_CUSTBPR_WEEKLY_FORECAST__INF_VW      ← vista: features sin target (inferencia)
-├── FEAT_UNIBOX_CUSTBPR_WEEKLY_FORECAST__HOLDOUT      ← tabla: holdout temporal (baselines)
-└── FEAT_UNIBOX_CUSTBPR_WEEKLY_FORECAST__HOLDOUT_VW  ← vista: holdout temporal (baselines)
+├── FEAT_CUSTBPR_WEEKLY                    ← tabla materializada de features
+├── FEAT_CUSTBPR_WEEKLY__TRAIN             ← tabla: features + target (entrenamiento)
+├── FEAT_CUSTBPR_WEEKLY__HOLDOUT           ← tabla: holdout temporal (baselines)
+├── FEAT_CUSTBPR_WEEKLY__INF               ← tabla: features para inferencia
+├── FEAT_CUSTBPR_WEEKLY__TRAIN_VW          ← vista: sobre __TRAIN (opcional)
+├── FEAT_CUSTBPR_WEEKLY__HOLDOUT_VW        ← vista: sobre __HOLDOUT (para baselines)
+└── FEAT_CUSTBPR_WEEKLY__INF_VW            ← vista: sobre __INF (para inferencia)
 ```
 
 > [!IMPORTANT]
-> **Contrato de interfaz**: El pipeline de entrenamiento debe leer **siempre** de
-> `FEAT_<model>__TRAIN_VW`. Cuando el Feature Store se conecte a fuentes de
+> **Contrato de interfaz**: El pipeline de entrenamiento puede leer de
+> `FEAT_<entity>_<frequency>__TRAIN` (tabla) o `FEAT_<entity>_<frequency>__TRAIN_VW` (vista).
+> Las vistas `_VW` se usan cuando se necesita aplicar transformaciones adicionales
+> o filtros sin modificar las tablas base. Cuando el Feature Store se conecte a fuentes de
 > producción, solo cambia la **materialización upstream** (cómo se llena la tabla).
-> La vista mantiene la misma estructura, garantizando **cero cambios** en los
+> La interfaz mantiene la misma estructura, garantizando **cero cambios** en los
 > scripts de entrenamiento e inferencia.
 
 
-### 2.4 Shared Features (Futuro)
+### 2.4 Shared Features Benefits
 
-Si múltiples modelos comparten features comunes (e.g. features de cliente),
-se extraen a una tabla compartida por entidad:
-
-```
-FEAT_SHARED_<entity>_<frequency>       e.g. FEAT_SHARED_CBR_WK
-```
-
-Los feature stores específicos de cada modelo pueden referenciar la tabla
-compartida mediante JOINs o vistas, manteniendo la interfaz `FEAT_<model>__*_VW`.
+Al desacoplar el feature store del modelo específico:
+- ✅ Múltiples modelos pueden usar las mismas features
+- ✅ Reduce duplicación de datos
+- ✅ Facilita experimentación con nuevos modelos
+- ✅ Mejora mantenibilidad (una fuente de verdad)
+- ✅ Permite evolución independiente de features y modelos
 
 ---
 
@@ -201,26 +207,66 @@ EXP_<model>_<search_type>_<YYYYMMDD>
 
 ## 4. Observability Tables
 
-### 4.1 Pattern
+### 4.1 Strategy: Generic Observability (Model-Agnostic)
+
+Las tablas de observabilidad son **genéricas** y no están atadas a un modelo específico.
+Esto permite monitorear múltiples modelos en las mismas tablas, facilitando comparaciones
+y análisis centralizados.
+
+### 4.2 Pattern
 
 ```
-OBS_<model>__<metric_type>
+OBS_<metric_type>
 ```
 
-El doble underscore (`__`) separa el nombre del modelo del tipo de métrica,
-manteniendo consistencia con la convención de vistas del feature store.
+El doble underscore (`__`) se usa solo para separar sufijos de tipo de dato (como baseline).
 
-| Nombre actual | Nombre propuesto | Tipo |
-|---|---|---|
-| `DA_PREDICTIONS` | `OBS_UNIBOX_CUSTBPR_WEEKLY_FORECAST__PRED` | Predicciones |
-| `DA_DATA_DRIFT` | `OBS_UNIBOX_CUSTBPR_WEEKLY_FORECAST__DATA_DRIFT` | Métricas de drift de datos |
-| `DA_DATA_DRIFT_HISTOGRAMS` | `OBS_UNIBOX_CUSTBPR_WEEKLY_FORECAST__DATA_HIST` | Histogramas de datos (producción) |
-| `DA_DATA_DRIFT_HISTOGRAMS_BASELINE` | `OBS_UNIBOX_CUSTBPR_WEEKLY_FORECAST__DATA_HIST_BL` | Histogramas de datos (baseline) |
-| `DA_PREDICTION_DRIFT` | `OBS_UNIBOX_CUSTBPR_WEEKLY_FORECAST__PRED_DRIFT` | Métricas de drift de predicciones |
-| `DA_PREDICTION_DRIFT_HISTOGRAMS` | `OBS_UNIBOX_CUSTBPR_WEEKLY_FORECAST__PRED_HIST` | Histogramas de predicciones (producción) |
-| `DA_PREDICTION_DRIFT_HISTOGRAMS_BASELINE` | `OBS_UNIBOX_CUSTBPR_WEEKLY_FORECAST__PRED_HIST_BL` | Histogramas de predicciones (baseline) |
-| `DA_PERFORMANCE` | `OBS_UNIBOX_CUSTBPR_WEEKLY_FORECAST__PERF` | Métricas de rendimiento (producción) |
-| `DA_PERFORMANCE_BASELINE` | `OBS_UNIBOX_CUSTBPR_WEEKLY_FORECAST__PERF_BL` | Métricas de rendimiento (baseline) |
+#### Predicciones
+OBS_PREDICTIONS              # Tabla de predicciones (producción)
+OBS_PREDICTIONS_VW           # Vista de predicciones con metadata
+OBS_PREDICTIONS_BL           # Tabla de predicciones (baseline)
+OBS_PREDICTIONS_BL_VW        # Vista de predicciones baseline
+
+####  Data Drift
+OBS_DATA_HIST                # Histogramas de datos (producción)
+OBS_DATA_HIST_BL             # Histogramas de datos (baseline)
+OBS_DATA_DRIFT               # Métricas de data drift
+
+####  Prediction Drift
+OBS_PRED_HIST                # Histogramas de predicciones (producción)
+OBS_PRED_HIST_BL             # Histogramas de predicciones (baseline)
+OBS_PRED_DRIFT               # Métricas de prediction drift
+
+####  Performance
+OBS_PERFORMANCE              # Métricas de performance (producción)
+OBS_PERFORMANCE_BL           # Métricas de performance (baseline)
+
+
+### 4.3 Model Identification
+
+Dado que las tablas son compartidas, cada registro incluye columnas para identificar
+el modelo:
+
+```sql
+-- Columnas estándar en todas las tablas de observabilidad
+MODEL_NAME       VARCHAR(64)   -- Nombre del modelo (e.g., 'UNIBOX_CUSTBPR_WEEKLY_FORECAST')
+MODEL_VERSION    VARCHAR(32)   -- Versión del modelo (e.g., 'v_20260317_1430')
+```
+
+Esto permite:
+- 🔍 Filtrar por modelo específico
+- 📊 Comparar múltiples modelos en la misma tabla
+- 📈 Análisis histórico de evolución de modelos
+- 🎯 Alertas configurables por modelo
+
+### 4.4 Benefits
+
+Al usar tablas genéricas de observabilidad:
+- ✅ Facilita comparación entre modelos
+- ✅ Reduce proliferación de tablas (1 tabla para N modelos)
+- ✅ Simplifica queries y dashboards (una sola fuente)
+- ✅ Mejora escalabilidad (agregar modelo = 0 nuevas tablas)
+- ✅ Permite análisis cross-model
 
 ---
 

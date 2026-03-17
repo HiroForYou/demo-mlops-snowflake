@@ -28,12 +28,14 @@ STORAGE_SCHEMA  = "SC_STORAGE_BMX_PS"
 FEATURES_SCHEMA = "SC_FEATURES_BMX"
 MODELS_SCHEMA   = "SC_MODELS_BMX"
 
-# Model name (base for all derived objects)
+# Model name (base for all model-specific objects)
 MODEL_NAME = "UNIBOX_CUSTBPR_WEEKLY_FORECAST"
 
+# Feature store name (shared by entity and frequency, not tied to model)
+FEATURE_STORE_NAME = "FEAT_CUSTBPR_WEEKLY"
+
 # Input tables
-TRAIN_TABLE_CLEANED   = f"{DATABASE}.{FEATURES_SCHEMA}.FEAT_{MODEL_NAME}__TRAIN"
-PARTITIONED_MODEL_NAME = MODEL_NAME
+TRAIN_TABLE_CLEANED   = f"{DATABASE}.{FEATURES_SCHEMA}.{FEATURE_STORE_NAME}__TRAIN"
 VERSION_DATE           = datetime.now().strftime("%Y%m%d_%H%M")
 
 STATS_NTILE_GROUP_COL = "STATS_NTILE_GROUP"
@@ -224,7 +226,7 @@ print(f"Sample input: {len(sample_input)} rows  |  {len(feat_cols_for_sample)} f
 # ## 6. Register Partitioned Model
 
 # %%
-print(f"Registering {PARTITIONED_MODEL_NAME} v_{VERSION_DATE} ...")
+print(f"Registering {MODEL_NAME} v_{VERSION_DATE} ...")
 
 # Collect the concrete version name for each sub-model (resolves the PRODUCTION alias)
 import json as _json
@@ -249,7 +251,7 @@ for gn, ver in submodel_versions.items():
 
 mv = registry.log_model(
     partitioned_model,
-    model_name=PARTITIONED_MODEL_NAME,
+    model_name=MODEL_NAME,
     version_name=f"v_{VERSION_DATE}",
     comment=(
         f"Partitioned regression model for uni_box_week — "
@@ -260,12 +262,12 @@ mv = registry.log_model(
     task=task.Task.TABULAR_REGRESSION,
     options={"function_type": "TABLE_FUNCTION"},
 )
-print(f"Registered: {PARTITIONED_MODEL_NAME} v_{VERSION_DATE}")
+print(f"Registered: {MODEL_NAME} v_{VERSION_DATE}")
 print("Sub-model versions baked in:")
 for gn, ver in sorted(submodel_versions.items()):
     print(f"  {gn}: {ver}")
 
-model_fqn = f"{DATABASE}.{MODELS_SCHEMA}.{PARTITIONED_MODEL_NAME}"
+model_fqn = f"{DATABASE}.{MODELS_SCHEMA}.{MODEL_NAME}"
 try:
     session.sql(f"ALTER MODEL {model_fqn} VERSION PRODUCTION UNSET ALIAS").collect()
     print("Previous PRODUCTION alias removed")
@@ -279,12 +281,12 @@ print("PRODUCTION alias assigned to new version")
 
 # %%
 result = session.sql(f"""
-    SHOW MODELS LIKE '{PARTITIONED_MODEL_NAME}' IN SCHEMA {DATABASE}.{MODELS_SCHEMA}
+    SHOW MODELS LIKE '{MODEL_NAME}' IN SCHEMA {DATABASE}.{MODELS_SCHEMA}
 """).collect()
 
 if result:
     versions = session.sql(f"""
-        SHOW VERSIONS IN MODEL {DATABASE}.{MODELS_SCHEMA}.{PARTITIONED_MODEL_NAME}
+        SHOW VERSIONS IN MODEL {DATABASE}.{MODELS_SCHEMA}.{MODEL_NAME}
     """).collect()
     print(f"Model found in registry — {len(versions)} version(s):")
     for v in versions[-3:]:
@@ -297,7 +299,7 @@ else:
 
 # %%
 print(f"\nPartitioned model ready:")
-print(f"  Name:     {PARTITIONED_MODEL_NAME}")
+print(f"  Name:     {MODEL_NAME}")
 print(f"  Version:  v_{VERSION_DATE}")
 print(f"  Alias:    PRODUCTION")
 print(f"  Groups:   {len(loaded_models)} ({', '.join(sorted(loaded_models.keys())[:4])}...)")

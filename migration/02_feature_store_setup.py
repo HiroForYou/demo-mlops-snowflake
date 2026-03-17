@@ -1,11 +1,11 @@
 # %% [markdown]
 # # Feature Dataset Materialization
 #
-# Builds and materializes a feature dataset from TRAIN_DATASET_CLEANED into a
+# Builds and materializes a feature dataset from FEAT_CUSTBPR_WEEKLY__TRAIN into a
 # plain Snowflake table.  Steps performed:
 # 1. Ensure the destination schema exists.
 # 2. Build the feature query (all columns except identifiers and target).
-# 3. Materialize features into FEAT_UNIBOX_CUSTBPR_WEEKLY_FORECAST (CTAS / overwrite).
+# 3. Materialize features into FEAT_CUSTBPR_WEEKLY (CTAS / overwrite).
 
 # %% [markdown]
 # ## 1. Setup
@@ -23,12 +23,12 @@ DATABASE        = "BD_AA_DEV"
 STORAGE_SCHEMA  = "SC_STORAGE_BMX_PS"
 FEATURES_SCHEMA = "SC_FEATURES_BMX"
 
-# Model name (base for all derived objects)
-MODEL_NAME = "UNIBOX_CUSTBPR_WEEKLY_FORECAST"
+# Feature store name (shared by entity and frequency, not tied to model)
+FEATURE_STORE_NAME = "FEAT_CUSTBPR_WEEKLY"
 
 # Input and output tables
-TRAIN_TABLE_CLEANED = f"{DATABASE}.{FEATURES_SCHEMA}.FEAT_{MODEL_NAME}__TRAIN"
-FEATURES_TABLE      = f"{DATABASE}.{FEATURES_SCHEMA}.FEAT_{MODEL_NAME}"
+TRAIN_TABLE_CLEANED = f"{DATABASE}.{FEATURES_SCHEMA}.{FEATURE_STORE_NAME}__TRAIN"
+FEATURES_TABLE      = f"{DATABASE}.{FEATURES_SCHEMA}.{FEATURE_STORE_NAME}"
 
 TARGET_COLUMN       = "UNI_BOX_WEEK"
 STATS_NTILE_GROUP_COL = "STATS_NTILE_GROUP"

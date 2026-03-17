@@ -29,12 +29,12 @@ FEATURES_SCHEMA = "SC_FEATURES_BMX"
 session.sql(f"USE DATABASE {DATABASE}").collect()
 session.sql(f"USE SCHEMA {STORAGE_SCHEMA}").collect()
 
-# Model name (base for all derived objects)
+# Model name (base for all model-specific objects)
 MODEL_NAME = "UNIBOX_CUSTBPR_WEEKLY_FORECAST"
 
-# Target tables (baseline only)
-PRED_DRIFT_HISTOGRAMS_BASELINE = f"OBS_{MODEL_NAME}__PRED_HIST_BL"
-PRED_BASELINE_VW = f"OBS_{MODEL_NAME}__PRED_BL_VW"
+# Target tables (baseline only - generic, shared across models)
+PRED_DRIFT_HISTOGRAMS_BASELINE = "OBS_PRED_HIST_BL"
+PRED_BASELINE_VW = "OBS_PREDICTIONS_BL_VW"
 ID_COLS = ["customer_id", "brand_pres_ret", "prod_key"]
 AGG_COLS = ["STATS_NTILE_GROUP", "CUST_CATEGORY"]
 PREDICTION_COL = "PREDICTED_UNI_BOX_WEEK"

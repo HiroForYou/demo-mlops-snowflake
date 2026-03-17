@@ -24,7 +24,7 @@ session = get_active_session()
 # ### 1A. Constants
 #
 # Project constants: database, schemas, inference feature table,
-# prediction table (DA_PREDICTIONS), model specifications, input columns
+# prediction table (OBS_PREDICTIONS), model specifications, input columns
 # for PREDICT, and optional sampling and week filter parameters.
 
 # %%
@@ -38,21 +38,24 @@ SRC_STORAGE_SCHEMA = "SC_STORAGE_BMX_PS"
 session.sql(f"USE DATABASE {DATABASE}").collect()
 session.sql(f"USE SCHEMA {STORAGE_SCHEMA}").collect()
 
-# Model name (base for all derived objects)
+# Model name (base for all model-specific objects)
 MODEL_NAME = "UNIBOX_CUSTBPR_WEEKLY_FORECAST"
 
+# Feature store name (shared by entity and frequency, not tied to model)
+FEATURE_STORE_NAME = "FEAT_CUSTBPR_WEEKLY"
+
 # Auxiliary setup tables/views
-INFERENCE_DATASET_CLEANED = f"{DATABASE}.{FEATURES_SCHEMA}.FEAT_{MODEL_NAME}__INF"
+INFERENCE_DATASET_CLEANED = f"{DATABASE}.{FEATURES_SCHEMA}.{FEATURE_STORE_NAME}__INF"
 INFERENCE_CUST_CATEGORY_LOOKUP = "INFERENCE_CUST_CATEGORY_LOOKUP"
-DA_PREDICTIONS_VW = f"OBS_{MODEL_NAME}__PRED_VW"
+PREDICTIONS_VW = "OBS_PREDICTIONS_VW"
 GROUND_TRUTH_DATASET_STRUCTURED = "GROUND_TRUTH_DATASET_STRUCTURED"
 ACTUALS_TABLE_VW = "ACTUALS_TABLE_VW"
 
 # Input data source (inference dataset)
-FEATURE_TABLE = f"{DATABASE}.{FEATURES_SCHEMA}.FEAT_{MODEL_NAME}__INF_VW"
+FEATURE_TABLE = f"{DATABASE}.{FEATURES_SCHEMA}.{FEATURE_STORE_NAME}__INF_VW"
 
-# Landing location
-PREDICTION_TABLE = f"OBS_{MODEL_NAME}__PRED"
+# Landing location (generic, shared across models)
+PREDICTION_TABLE = "OBS_PREDICTIONS"
 MODEL_FQN = f"{DATABASE}.{MODELS_SCHEMA}.{MODEL_NAME}"
 
 # Tags whose values identify model versions to run inference for.
@@ -86,7 +89,7 @@ MIN_INFERENCE_TIME = None          # Set to e.g. "202545" to only process weeks 
 # %% [markdown]
 # ### 1B. Create landing table
 #
-# Creates the DA_PREDICTIONS table if it doesn't exist. Stores individual predictions
+# Creates the OBS_PREDICTIONS table if it doesn't exist. Stores individual predictions
 # with their RECORD_ID, model version, ENTITY_MAP (record metadata), and prediction.
 
 # %%
@@ -164,14 +167,14 @@ print(f"Inference dataset: {total_rows:,} rows")
 #
 # Executes partitioned inference for each candidate model version.
 # First resolves versions from tags, identifies which combinations
-# (version, week) are missing in DA_PREDICTIONS, and then executes MODEL()!PREDICT
+# (version, week) are missing in OBS_PREDICTIONS, and then executes MODEL()!PREDICT
 # in batches by week.
 
 # %% [markdown]
 # ### 3A. Resolve model versions from tags
 #
 # Reads model tags (e.g., CANDIDATE_VERSION) and extracts active versions.
-# Then identifies which combinations (version, week) already exist in DA_PREDICTIONS
+# Then identifies which combinations (version, week) already exist in OBS_PREDICTIONS
 # to avoid recalculating duplicate predictions.
 
 # %%
@@ -240,7 +243,7 @@ print(f"Version-week combos needing inference: "
 #
 # For each candidate version, executes partitioned SQL inference by STATS_NTILE_GROUP
 # over each missing week. Each batch is loaded as a temporary view (BATCH_PAGE) and
-# predictions are inserted directly into DA_PREDICTIONS.
+# predictions are inserted directly into OBS_PREDICTIONS.
 
 # %%
 input_col_refs = ",\n        ".join(f"{c} => t.{c}" for c in PREDICT_INPUT_COLS)
@@ -332,7 +335,7 @@ print(insert_batch_sql)
 # ### 3C. Summary
 #
 # Final summary: shows the prediction count per version and the total
-# stored in DA_PREDICTIONS for this model.
+# stored in OBS_PREDICTIONS for this model.
 
 # %%
 for version in versions_to_run:
@@ -358,7 +361,7 @@ print(f"\nTotal predictions in {PREDICTION_TABLE}: {total:,}")
 
 # %%
 session.sql(f"""
-CREATE OR REPLACE TRANSIENT TABLE {DA_PREDICTIONS_VW} AS
+CREATE OR REPLACE TRANSIENT TABLE {PREDICTIONS_VW} AS
 SELECT
     vw.*,
     mp.stats_ntile_group,
@@ -382,7 +385,7 @@ FROM {GROUND_TRUTH_DATASET_STRUCTURED} AS td
 WHERE week < 202548
 """).collect()
 
-print(f"Post-inference setup complete: {DA_PREDICTIONS_VW}, {GROUND_TRUTH_DATASET_STRUCTURED}, {ACTUALS_TABLE_VW}")
+print(f"Post-inference setup complete: {PREDICTIONS_VW}, {GROUND_TRUTH_DATASET_STRUCTURED}, {ACTUALS_TABLE_VW}")
 
 # %% [markdown]
 # ## 5. (Optional) Sample Inference via Registry (Python/pandas)

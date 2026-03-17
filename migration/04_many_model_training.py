@@ -2,8 +2,8 @@
 # # MMT: 16 Models (LGBM / XGB per stats_ntile_group)
 #
 # Loads per-group hyperparameters from ML Experiments (or the
-# HYPERPARAMETER_RESULTS fallback table), trains one model per group using
-# ManyModelTraining, and registers each model in the Snowflake Model Registry.
+# fallback table), trains one model per group using ManyModelTraining,
+# and registers each model in the Snowflake Model Registry.
 
 # %% [markdown]
 # ## 1. Setup
@@ -31,12 +31,15 @@ STORAGE_SCHEMA  = "SC_STORAGE_BMX_PS"
 FEATURES_SCHEMA = "SC_FEATURES_BMX"
 MODELS_SCHEMA   = "SC_MODELS_BMX"
 
-# Model name (base for all derived objects)
+# Model name (base for all model-specific objects)
 MODEL_NAME = "UNIBOX_CUSTBPR_WEEKLY_FORECAST"
 
+# Feature store name (shared by entity and frequency, not tied to model)
+FEATURE_STORE_NAME = "FEAT_CUSTBPR_WEEKLY"
+
 # Input tables
-TRAIN_TABLE_CLEANED         = f"{DATABASE}.{FEATURES_SCHEMA}.FEAT_{MODEL_NAME}__TRAIN"
-FEATURES_TABLE              = f"{DATABASE}.{FEATURES_SCHEMA}.FEAT_{MODEL_NAME}"
+TRAIN_TABLE_CLEANED         = f"{DATABASE}.{FEATURES_SCHEMA}.{FEATURE_STORE_NAME}__TRAIN"
+FEATURES_TABLE              = f"{DATABASE}.{FEATURES_SCHEMA}.{FEATURE_STORE_NAME}"
 HYPERPARAMETER_RESULTS_TABLE = f"{DATABASE}.{MODELS_SCHEMA}.HPO_{MODEL_NAME}"
 MMT_STAGE                   = f"{DATABASE}.{MODELS_SCHEMA}.MMT_MODELS"
 
