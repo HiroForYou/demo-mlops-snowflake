@@ -50,7 +50,8 @@ v_YYYYMMDD_HHMM      ← formato de versión (e.g. v_20260311_1430)
 
 En desarrollo se usan **aliases** para marcar el estado del modelo dentro del ciclo
 de experimentación. El alias `PRODUCTION` indica que esa versión está lista para
-ser promovida al ambiente productivo.
+ser promovida al ambiente productivo. En producción, el script 07 asigna esa
+versión a tags específicos por caso de uso (ver `PRODUCTION_<USE_CASE>`).
 
 | Mecanismo | Propósito | Ejemplo |
 |-----------|-----------|---------|
@@ -68,8 +69,13 @@ leídos por los pipelines de inferencia y observabilidad para determinar qué ve
 
 | Mecanismo | Propósito | Ejemplo |
 |-----------|-----------|---------|
-| Tag `CANDIDATE_VERSION` | Versión activa para inferencia batch | `ALTER MODEL ... SET TAG CANDIDATE_VERSION = 'v_20260311_1430'` |
-| Tag `ROLLBACK_VERSION` | Versión anterior (rollback rápido) | `ALTER MODEL ... SET TAG ROLLBACK_VERSION = 'v_20260301_0900'` |
+| Tag `PRODUCTION_<USE_CASE>` | Versión activa para inferencia batch (para ese caso de uso) | `ALTER MODEL ... SET TAG PRODUCTION_<USE_CASE> = 'v_20260311_1430'` |
+| Tag `ROLLBACK_VERSION_<USE_CASE>` | Versión anterior (rollback rápido) | `ALTER MODEL ... SET TAG ROLLBACK_VERSION_<USE_CASE> = 'v_20260301_0900'` |
+
+> [!NOTE]
+> `<USE_CASE>` debe ser un identificador estable del cliente o caso de uso (ver sección 5.6).
+> Los pipelines deben leer los tags correspondientes a ese `<USE_CASE>` para seleccionar la versión.
+> Si hoy los pipelines leen `CANDIDATE_VERSION`, deberán ajustarse para usar `PRODUCTION_<USE_CASE>` (y `ROLLBACK_VERSION_<USE_CASE>`).
 
 ```mermaid
 flowchart LR
@@ -77,7 +83,7 @@ flowchart LR
         A["v_20260311_1430"] -- "PRODUCTION alias" --> B["Listo para promover"]
     end
     subgraph PROD ["BD_AA_PRD (producción)"]
-        C["v_20260311_1430"] -- "tag CANDIDATE_VERSION" --> D["Pipeline de inferencia"]
+        C["v_20260311_1430"] -- "tag PRODUCTION_<USE_CASE>" --> D["Pipeline de inferencia"]
     end
     B -- "Script 07: migración" --> C
 ```
@@ -317,6 +323,20 @@ registrar un modelo nuevo** para garantizar unicidad y consistencia.
 | `BAYESIAN` | Bayesian Optimization | Optimización bayesiana (BO/TPE) |
 | `GRID` | Grid Search | Búsqueda exhaustiva en grilla |
 | `GENETIC` | Genetic Algorithm | Algoritmo genético |
+
+### 5.6 Use Cases (cliente o caso de uso)
+
+Para los tags de producción (por ejemplo `PRODUCTION_<USE_CASE>`), se usa un token
+`<USE_CASE>` que identifica de forma estable el cliente o caso de uso (no la versión del modelo).
+
+Reglas de formato:
+- `UPPER_SNAKE_CASE` (solo `A-Z`, números y `_`)
+- sin espacios ni caracteres especiales
+
+Ejemplos:
+- `CLIENTA_DEFAULT`
+- `CLIENTB_B2B`
+- `PROMO_Q4`
 
 > [!NOTE]
 > Si un nuevo modelo no encaja en las dimensiones existentes, primero se

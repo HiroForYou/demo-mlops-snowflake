@@ -14,14 +14,14 @@
 
 # %%
 from snowflake.snowpark.context import get_active_session
-from snowflake.snowpark import functions as F, Window, Row
+
 session = get_active_session()
 
 # %% [markdown]
 # ### 1A. Constants
 #
 # Project constants: input tables (features, predictions, actuals),
-# baseline tables (read-only, populated by notebooks 06+07), landing tables
+# baseline tables (read-only, populated by notebooks 06+07a), landing tables
 # (created by this notebook), and drift metrics and thresholds configuration.
 
 # %%

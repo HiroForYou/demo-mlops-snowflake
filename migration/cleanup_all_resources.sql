@@ -52,7 +52,7 @@ DROP MODEL IF EXISTS BD_AA_DEV.SC_MODELS_BMX.UNI_BOX_REGRESSION_GROUP_STAT_3_4;
 -- Stage para Many Model Training (creado en 04_many_model_training.py)
 DROP STAGE IF EXISTS BD_AA_DEV.SC_MODELS_BMX.MMT_MODELS;
 
--- Tag para versionado de modelos candidatos (creado en 07_environment_change.py)
+-- Tag para versionado de modelos candidatos (creado en 07a/07b)
 DROP TAG IF EXISTS BD_AA_DEV.SC_STORAGE_BMX_PS.CANDIDATE_VERSION;
 DROP TAG IF EXISTS BD_AA_DEV.SC_MODELS_BMX.CANDIDATE_VERSION;
 

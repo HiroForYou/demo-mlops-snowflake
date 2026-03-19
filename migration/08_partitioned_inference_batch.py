@@ -2,14 +2,14 @@
 # # Partitioned Inference — Inference Dataset
 #
 # This notebook executes the partitioned inference of the model on production data.
-# It reads candidate versions from model tags (CANDIDATE_VERSION), identifies 
+# It reads active versions from model tags (PRODUCTION_<USE_CASE>), identifies 
 # which combinations (version, week) are missing from the predictions table, and executes
 # MODEL()!PREDICT partitioned by STATS_NTILE_GROUP for each batch.
 # The resulting predictions feed the observability notebook (09).
 #
 # ## Data Flow
 # This script uses inference data already prepared in SC_FEATURES_BMX (created in script 01).
-# Script 07 migrates the model and baselines, but inference data remains in its original location.
+# Scripts 07a/07b migrate baselines and deploy tagged production model versions.
 # This script creates auxiliary views and lookups to support the inference process.
 
 # %% [markdown]
@@ -37,7 +37,7 @@ session = get_active_session()
 DATABASE = "BD_AA_DEV"
 STORAGE_SCHEMA = "SC_FEATURES_BMX"  # Working schema for inference and observability
 FEATURES_SCHEMA = "SC_FEATURES_BMX"  # Schema where feature tables are stored
-MODELS_SCHEMA = "SC_STORAGE_BMX_PS"  # Schema where production models are deployed (after script 07)
+MODELS_SCHEMA = "SC_STORAGE_BMX_PS"  # Schema where production models are deployed (after script 07b)
 SRC_STORAGE_SCHEMA = "SC_STORAGE_BMX_PS"  # Original schema for ground truth data
 
 session.sql(f"USE DATABASE {DATABASE}").collect()
@@ -67,10 +67,13 @@ FEATURE_TABLE = f"{DATABASE}.{FEATURES_SCHEMA}.{FEATURE_STORE_NAME}__INF_VW"
 PREDICTION_TABLE = f"{DATABASE}.{FEATURES_SCHEMA}.OBS_PREDICTIONS"
 MODEL_FQN = f"{DATABASE}.{MODELS_SCHEMA}.{MODEL_NAME}"
 
-# Tags whose values identify model versions to run inference for.
-# Each tag value is expected to hold a version name (see script 17).
-# These are the short tag names as they appear in Model.show_tags().
-MODEL_TAGS = ["CANDIDATE_VERSION"]
+# Use-case token used to select the production tag.
+# Its value is embedded in the tag name: PRODUCTION_<USE_CASE> (and ROLLBACK_VERSION_<USE_CASE>).
+USE_CASE = "CLIENTA_DEFAULT"
+
+# These are the short tag names as they appear in Model.show_tags() output (after splitting by '.').
+PRODUCTION_TAG_SHORT = f"PRODUCTION_{USE_CASE}".upper()
+ROLLBACK_TAG_SHORT = f"ROLLBACK_VERSION_{USE_CASE}".upper()
 
 ID_COLS = ["customer_id", "brand_pres_ret", "prod_key"]
 PARTITION_COL = "STATS_NTILE_GROUP"
@@ -181,7 +184,8 @@ print(f"Inference dataset: {total_rows:,} rows")
 # %% [markdown]
 # ### 3A. Resolve model versions from tags
 #
-# Reads model tags (e.g., CANDIDATE_VERSION) and extracts active versions.
+# Reads model tags (PRODUCTION_<USE_CASE>, optionally fallback to ROLLBACK_VERSION_<USE_CASE>)
+# and extracts active versions.
 # Then identifies which combinations (version, week) already exist in OBS_PREDICTIONS
 # to avoid recalculating duplicate predictions.
 
@@ -194,18 +198,35 @@ registry = Registry(
 model_ref = registry.get_model(MODEL_NAME)
 all_tags = model_ref.show_tags()
 
-# Build a table of tags -> versions and whether they are active (in MODEL_TAGS)
-tag_rows = []
+# Resolve versions from tags for this use case.
+prod_versions = []
+rollback_versions = []
 for tag_name, tag_value in all_tags.items():
     tag_short = tag_name.split(".")[-1].upper()  # FQN -> short name
-    active = tag_short in [t.upper() for t in MODEL_TAGS]
-    tag_rows.append({"TAG": tag_short, "VERSION": tag_value, "ACTIVE": active})
+    if tag_short == PRODUCTION_TAG_SHORT and tag_value:
+        prod_versions.append(tag_value)
+    elif tag_short == ROLLBACK_TAG_SHORT and tag_value:
+        rollback_versions.append(tag_value)
 
-tag_df = session.create_dataframe(tag_rows)
-tag_df.show()
+versions_to_run = list(dict.fromkeys(prod_versions))  # dedupe while preserving order
 
-# Collect the deduplicated set of versions from active tags
-versions_to_run = list({r["VERSION"] for r in tag_rows if r["ACTIVE"] and r["VERSION"]})
+if not versions_to_run:
+    versions_to_run = list(dict.fromkeys(rollback_versions))
+    if versions_to_run:
+        print(
+            f"PRODUCTION tag not found for use_case={USE_CASE}; "
+            f"falling back to ROLLBACK tag."
+        )
+
+if not versions_to_run:
+    available = sorted({k.split(".")[-1].upper() for k in all_tags.keys()})
+    raise ValueError(
+        f"No active versions found for use_case={USE_CASE}. "
+        f"Expected tags: {PRODUCTION_TAG_SHORT} (or {ROLLBACK_TAG_SHORT}). "
+        f"Available tags: {available}"
+    )
+
+print(f"Using versions from tags for use_case={USE_CASE}: {versions_to_run}")
 
 # %%
 # Get all WEEK values from the features data (respecting MIN_INFERENCE_TIME)
