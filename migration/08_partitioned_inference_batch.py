@@ -6,6 +6,11 @@
 # which combinations (version, week) are missing from the predictions table, and executes
 # MODEL()!PREDICT partitioned by STATS_NTILE_GROUP for each batch.
 # The resulting predictions feed the observability notebook (09).
+#
+# ## Data Flow
+# This script uses inference data already prepared in SC_FEATURES_BMX (created in script 01).
+# Script 07 migrates the model and baselines, but inference data remains in its original location.
+# This script creates auxiliary views and lookups to support the inference process.
 
 # %% [markdown]
 # ## 1. Setup
@@ -30,10 +35,10 @@ session = get_active_session()
 # %%
 # Account info
 DATABASE = "BD_AA_DEV"
-STORAGE_SCHEMA = "SC_FEATURES_BMX"
-FEATURES_SCHEMA = "SC_FEATURES_BMX"
-MODELS_SCHEMA = "SC_STORAGE_BMX_PS"
-SRC_STORAGE_SCHEMA = "SC_STORAGE_BMX_PS"
+STORAGE_SCHEMA = "SC_FEATURES_BMX"  # Working schema for inference and observability
+FEATURES_SCHEMA = "SC_FEATURES_BMX"  # Schema where feature tables are stored
+MODELS_SCHEMA = "SC_STORAGE_BMX_PS"  # Schema where production models are deployed (after script 07)
+SRC_STORAGE_SCHEMA = "SC_STORAGE_BMX_PS"  # Original schema for ground truth data
 
 session.sql(f"USE DATABASE {DATABASE}").collect()
 session.sql(f"USE SCHEMA {STORAGE_SCHEMA}").collect()
@@ -45,17 +50,21 @@ MODEL_NAME = "UNIBOX_CUSTBPR_WEEKLY_FORECAST"
 FEATURE_STORE_NAME = "FEAT_CUSTBPR_WEEKLY"
 
 # Auxiliary setup tables/views
+# NOTE: Inference and ground truth datasets already exist in SC_FEATURES_BMX (created in script 01)
+# They are NOT cloned from SC_STORAGE_BMX_PS because script 07 only migrates models and baselines
 INFERENCE_DATASET_CLEANED = f"{DATABASE}.{FEATURES_SCHEMA}.{FEATURE_STORE_NAME}__INF"
-INFERENCE_CUST_CATEGORY_LOOKUP = "INFERENCE_CUST_CATEGORY_LOOKUP"
-PREDICTIONS_VW = "OBS_PREDICTIONS_VW"
-GROUND_TRUTH_DATASET_STRUCTURED = "GROUND_TRUTH_DATASET_STRUCTURED"
-ACTUALS_TABLE_VW = "ACTUALS_TABLE_VW"
+INFERENCE_CUST_CATEGORY_LOOKUP = f"{DATABASE}.{FEATURES_SCHEMA}.INFERENCE_CUST_CATEGORY_LOOKUP"
+PREDICTIONS_VW = f"{DATABASE}.{FEATURES_SCHEMA}.OBS_PREDICTIONS_VW"
+GROUND_TRUTH_DATASET_STRUCTURED = f"{DATABASE}.{SRC_STORAGE_SCHEMA}.GROUND_TRUTH_DATASET_STRUCTURED"
+ACTUALS_TABLE_VW = f"{DATABASE}.{FEATURES_SCHEMA}.ACTUALS_TABLE_VW"
 
 # Input data source (inference dataset)
+# This view is created in section 1C from the cloned inference data
 FEATURE_TABLE = f"{DATABASE}.{FEATURES_SCHEMA}.{FEATURE_STORE_NAME}__INF_VW"
 
 # Landing location (generic, shared across models)
-PREDICTION_TABLE = "OBS_PREDICTIONS"
+# All predictions are stored here in the TARGET environment
+PREDICTION_TABLE = f"{DATABASE}.{FEATURES_SCHEMA}.OBS_PREDICTIONS"
 MODEL_FQN = f"{DATABASE}.{MODELS_SCHEMA}.{MODEL_NAME}"
 
 # Tags whose values identify model versions to run inference for.
@@ -113,13 +122,11 @@ print(f"Landing table ready: {PREDICTION_TABLE}")
 # ### 1C. Create setup objects
 #
 # Creates auxiliary lookups and views required for inference.
+# NOTE: Inference dataset already exists in SC_FEATURES_BMX (created in script 01),
+# so we don't need to clone it. We only create the category lookup and feature view.
 
 # %%
-session.sql(f"""
-CREATE OR REPLACE TRANSIENT TABLE {INFERENCE_DATASET_CLEANED}
-CLONE {DATABASE}.{SRC_STORAGE_SCHEMA}.{INFERENCE_DATASET_CLEANED}
-""").collect()
-
+# Create category lookup from existing inference dataset
 session.sql(f"""
 CREATE OR REPLACE TRANSIENT TABLE {INFERENCE_CUST_CATEGORY_LOOKUP} AS
 SELECT DISTINCT
@@ -137,6 +144,7 @@ SELECT DISTINCT
 FROM {INFERENCE_DATASET_CLEANED}
 """).collect()
 
+# Create feature view with category enrichment
 session.sql(f"""
 CREATE OR REPLACE VIEW {FEATURE_TABLE} AS
 SELECT vw.*, mp.cust_category
@@ -357,9 +365,12 @@ print(f"\nTotal predictions in {PREDICTION_TABLE}: {total:,}")
 # %% [markdown]
 # ## 4. Post-inference setup
 #
-# Creates final views and clones ground truth data.
+# Creates final views and references ground truth data.
+# NOTE: Ground truth dataset is in SC_STORAGE_BMX_PS (original location).
+# We create views to access it from the current schema.
 
 # %%
+# Create predictions view with category enrichment
 session.sql(f"""
 CREATE OR REPLACE TRANSIENT TABLE {PREDICTIONS_VW} AS
 SELECT
@@ -373,11 +384,8 @@ ON vw.entity_map:customer_id = mp.customer_id
     AND vw.entity_map:week = mp.week
 """).collect()
 
-session.sql(f"""
-CREATE OR REPLACE TRANSIENT TABLE {GROUND_TRUTH_DATASET_STRUCTURED}
-CLONE {DATABASE}.{SRC_STORAGE_SCHEMA}.{GROUND_TRUTH_DATASET_STRUCTURED}
-""").collect()
-
+# Create actuals view (filter data before a specific week for testing)
+# This references the ground truth dataset in SC_STORAGE_BMX_PS
 session.sql(f"""
 CREATE OR REPLACE VIEW {ACTUALS_TABLE_VW} AS
 SELECT *
@@ -385,7 +393,10 @@ FROM {GROUND_TRUTH_DATASET_STRUCTURED} AS td
 WHERE week < 202548
 """).collect()
 
-print(f"Post-inference setup complete: {PREDICTIONS_VW}, {GROUND_TRUTH_DATASET_STRUCTURED}, {ACTUALS_TABLE_VW}")
+print(f"Post-inference setup complete:")
+print(f"  - Predictions view: {PREDICTIONS_VW}")
+print(f"  - Actuals view: {ACTUALS_TABLE_VW}")
+print(f"  - Ground truth (SOURCE): {GROUND_TRUTH_DATASET_STRUCTURED}")
 
 # %% [markdown]
 # ## 5. (Optional) Sample Inference via Registry (Python/pandas)

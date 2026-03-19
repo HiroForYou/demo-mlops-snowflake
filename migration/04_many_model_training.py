@@ -423,9 +423,9 @@ except Exception as e:
 start_time   = time.time()
 trainer      = ManyModelTraining(train_segment_model, MMT_STAGE)
 training_run = trainer.run(
-    partition_by=PARTITION_COL,
+    partition_by=STATS_NTILE_GROUP_COL,
     snowpark_dataframe=training_df,
-    run_id=f"uni_box_regression_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+    run_id=f"{MODEL_NAME.lower()}_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
 )
 print(f"Run ID: {training_run.run_id}")
 

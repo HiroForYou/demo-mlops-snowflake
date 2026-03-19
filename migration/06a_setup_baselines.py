@@ -55,7 +55,7 @@ PERF_BASELINE = "OBS_PERFORMANCE_BL"
 
 # Auxiliary setup tables/views
 TRAIN_DATASET_HOLDOUT = f"{DATABASE}.{FEATURES_SCHEMA}.{FEATURE_STORE_NAME}__HOLDOUT"
-TRAIN_CUST_CATEGORY_LOOKUP = "TRAIN_CUST_CATEGORY_LOOKUP"
+TRAIN_CUST_CATEGORY_LOOKUP = f"{DATABASE}.{STORAGE_SCHEMA}.TRAIN_CUST_CATEGORY_LOOKUP"
 ID_COLS = ["customer_id", "brand_pres_ret", "prod_key"]
 AGG_COLS = ["STATS_NTILE_GROUP", "CUST_CATEGORY"]
 PARTITION_COL = "STATS_NTILE_GROUP"
@@ -187,9 +187,9 @@ session.sql(f"CREATE TABLE IF NOT EXISTS {PRED_BASELINE} ({PRED_BASELINE_SCHEMA}
 print("Target tables ready.")
 
 # %% [markdown]
-# ## 2. Inference on training data
+# ## 2. Inference on holdout data
 #
-# Partitioned inference of the PRODUCTION model is executed on the training data.
+# Partitioned inference of the PRODUCTION model is executed on the holdout data.
 # The resulting predictions are stored in OBS_PREDICTIONS_BL and serve as
 # a reference for calculating prediction histograms and baseline performance metrics.
 
