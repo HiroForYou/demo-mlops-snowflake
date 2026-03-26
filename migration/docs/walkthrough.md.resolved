@@ -28,7 +28,7 @@ flowchart TD
 > Valida y limpia los datasets de entrenamiento e inferencia.
 
 - Verifica estructura, NULLs, outliers, distribución del target `UNI_BOX_WEEK`
-- Cap de outliers al percentil 99
+- Filtrado/recorte opcional de outliers al percentil 99 global (controlado por `APPLY_OUTLIER_FILTER_P99`; default `False`)
 - Verifica compatibilidad de features entre train e inference
 - **Split temporal**: 90% train → `TRAIN_DATASET_CLEANED`, 10% holdout → `TRAIN_DATASET_HOLDOUT`
 - Limpia inferencia → `INFERENCE_DATASET_CLEANED`

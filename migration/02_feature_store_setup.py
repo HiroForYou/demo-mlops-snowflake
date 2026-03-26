@@ -9,7 +9,9 @@
 
 # %% [markdown]
 # ## 1. Setup
-
+# 
+# Create the active Snowpark session used to run all subsequent Snowflake SQL
+# and DataFrame operations.
 # %%
 from snowflake.snowpark.context import get_active_session
 
@@ -17,7 +19,9 @@ session = get_active_session()
 
 # %% [markdown]
 # ### 1A. Constants
-
+# 
+# Define database/schema/table identifiers and the list of metadata columns
+# excluded from the feature set.
 # %%
 DATABASE        = "BD_AA_DEV"
 STORAGE_SCHEMA  = "SC_STORAGE_BMX_PS"
@@ -49,14 +53,19 @@ print(f"Session: {session.get_current_database()}.{session.get_current_schema()}
 
 # %% [markdown]
 # ## 2. Ensure Features Schema Exists
-
+# 
+# Switch to the destination schema and create it if needed, so that the CTAS
+# that follows can write the final feature table.
 # %%
 session.sql(f"USE SCHEMA {FEATURES_SCHEMA}").collect()
 print(f"Schema ready: {FEATURES_SCHEMA}")
 
 # %% [markdown]
 # ## 3. Build Feature Query
-
+# 
+# Introspect the cleaned training table schema, pick feature columns
+# (excluding identifiers/metadata), and build the SELECT query that will be
+# materialized in the next step.
 # %%
 columns_info = session.sql(f"DESCRIBE TABLE {TRAIN_TABLE_CLEANED}").collect()
 all_columns  = [row["name"] for row in columns_info]
@@ -85,7 +94,9 @@ print(f"Feature records: {feature_count:,}")
 
 # %% [markdown]
 # ## 4. Materialize Features (CTAS)
-
+# 
+# Materialize the feature query into the final Snowflake table using overwrite
+# mode, then print a small sample for a quick sanity check.
 # %%
 feature_df.write.mode("overwrite").save_as_table(FEATURES_TABLE)
 print(f"Features table ready: {FEATURES_TABLE}")
@@ -95,7 +106,9 @@ session.table(FEATURES_TABLE).limit(5).show()
 
 # %% [markdown]
 # ## 5. Summary
-
+# 
+# Print the resulting table name and basic dataset statistics, then point to
+# the next script in the pipeline.
 # %%
 print(f"Features table: {FEATURES_TABLE}")
 print(f"Feature columns: {len(feature_df.columns)}")

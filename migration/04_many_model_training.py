@@ -46,6 +46,8 @@ MMT_STAGE                   = f"{DATABASE}.{MODELS_SCHEMA}.MMT_MODELS"
 TARGET_COLUMN         = "UNI_BOX_WEEK"
 STATS_NTILE_GROUP_COL = "STATS_NTILE_GROUP"
 VERSION_DATE          = datetime.now().strftime("%Y%m%d_%H%M")
+# For testing purposes, decoment this line and comment the next one (use the experiment date of the previous run)
+# EXPERIMENT_DATE = "20260318"
 EXPERIMENT_DATE       = datetime.now().strftime("%Y%m%d")
 EXPERIMENT_NAME       = f"EXP_{MODEL_NAME}_BAYESIAN_{EXPERIMENT_DATE}"
 
@@ -82,6 +84,9 @@ print(f"Session: {session.get_current_database()}.{session.get_current_schema()}
 
 # %% [markdown]
 # ## 2. Registry and Stage
+#
+# Prepares the Model Registry connection and creates the stage where the
+# ManyModelTraining artifacts will be written during training.
 
 # %%
 session.sql(f"CREATE STAGE IF NOT EXISTS {MMT_STAGE}").collect()
@@ -90,6 +95,10 @@ print(f"Registry ready: {DATABASE}.{MODELS_SCHEMA}")
 
 # %% [markdown]
 # ## 3. Load Hyperparameters (Experiments → Table fallback)
+#
+# Loads per-group best hyperparameters from ML Experiments for `EXPERIMENT_DATE`.
+# If Experiments are not available (or incomplete), it falls back to the
+# persisted results table and uses the most recent entry per group.
 
 # %%
 hyperparams_by_group = {}
@@ -192,6 +201,10 @@ DEFAULT_PARAMS_BY_MODEL = {
 
 # %% [markdown]
 # ## 4. Load Training Data
+#
+# Loads the engineered feature table and joins it with the labels/segment
+# identifiers from the cleaned training table, preparing the input dataset
+# for ManyModelTraining.
 
 # %%
 try:
@@ -218,6 +231,11 @@ training_df.group_by(STATS_NTILE_GROUP_COL).count().sort(STATS_NTILE_GROUP_COL).
 
 # %% [markdown]
 # ## 5. Helper Functions
+#
+# Helper utilities used by the per-partition training function:
+# - numeric feature column selection
+# - temporal train/test split defined per `STATS_NTILE_GROUP`
+# - the `train_segment_model` closure executed by ManyModelTraining workers.
 
 # %%
 def _get_feature_cols_numeric(df, excluded_cols):
@@ -244,37 +262,97 @@ def _get_feature_cols_numeric(df, excluded_cols):
     ]
 
 
-def temporal_train_val_split(df, feat_cols, target_col, test_fraction=0.2):
-    """Split a pandas DataFrame into temporal train and test sets.
+def temporal_train_val_split_pandas(df, feat_cols, target_col, test_fraction=0.2):
+    """Split a pandas DataFrame into temporal train and test sets (per group).
 
-    Records are sorted by ``WEEK`` (ascending) so the test set always contains
-    the most recent time periods.  This prevents data leakage into the past
-    that would occur with a random shuffle split.
+    This function implements a temporal holdout that is computed per `STATS_NTILE_GROUP`,
+    mirroring the cutoff-week logic used in `01_data_validation_and_cleaning.py`.
+    For each group, we compute:
+    1) row counts per (`STATS_NTILE_GROUP`, `WEEK`),
+    2) cumulative share ordered by `WEEK` ascending,
+    3) `cutoff_week` as the first week where cumulative share reaches/exceeds
+       ``1 - test_fraction``,
+    4) `train` as weeks ``<= cutoff_week`` and `test` as weeks ``> cutoff_week``.
+
+    Note: although `ManyModelTraining` already partitions by `STATS_NTILE_GROUP`,
+    this per-group cutoff keeps the temporal definition consistent and avoids
+    any accidental reliance on input ordering.
 
     Parameters
     ----------
     df : pandas.DataFrame
-        Full pandas DataFrame already fetched from Snowflake.  Must contain
-        ``feat_cols``, ``target_col``, and ideally a ``WEEK`` column.
+        Pandas DataFrame already fetched from Snowflake.
+        Must contain `WEEK` and `STATS_NTILE_GROUP_COL` plus the columns in `feat_cols`
+        and `target_col`.
     feat_cols : list[str]
         Feature column names to include in X.
     target_col : str
         Name of the target column.
     test_fraction : float, optional
-        Fraction of the most-recent records to reserve for the test set.
-        Default is 0.2 (last 20% of weeks).
+        Fraction of the most-recent weeks reserved for test (per group).
+        Default is 0.2.
 
     Returns
     -------
     tuple[pandas.DataFrame, pandas.DataFrame, pandas.Series, pandas.Series]
-        ``(X_train, X_test, y_train, y_test)`` — WEEK column excluded from X.
+        ``(X_train, X_test, y_train, y_test)`` — the `WEEK` column is excluded
+        from X via column selection using `feat_cols`.
     """
-    week_col = next((c for c in df.columns if c.upper() == "WEEK"), None)
-    sorted_df = df.sort_values(week_col, ascending=True, ignore_index=True) if week_col else df
+    import pandas as pd
 
-    split_idx    = int(len(sorted_df) * (1.0 - test_fraction))
-    train_df_pd  = sorted_df.iloc[:split_idx].reset_index(drop=True)
-    test_df_pd   = sorted_df.iloc[split_idx:].reset_index(drop=True)
+    week_col = next((c for c in df.columns if c.upper() == "WEEK"), None)
+    group_col = next(
+        (c for c in df.columns if c.upper() == STATS_NTILE_GROUP_COL.upper()), None
+    )
+
+    # Fallback: if missing required columns, do a global temporal split.
+    if not week_col or not group_col:
+        sorted_df = df.sort_values(week_col, ascending=True, ignore_index=True) if week_col else df
+        split_idx = int(len(sorted_df) * (1.0 - test_fraction))
+        train_df_pd = sorted_df.iloc[:split_idx].reset_index(drop=True)
+        test_df_pd = sorted_df.iloc[split_idx:].reset_index(drop=True)
+        return (
+            train_df_pd[feat_cols],
+            test_df_pd[feat_cols],
+            train_df_pd[target_col],
+            test_df_pd[target_col],
+        )
+
+    threshold = 1.0 - float(test_fraction)
+    train_parts = []
+    test_parts = []
+
+    for _, gdf in df.groupby(group_col):
+        gdf_sorted = gdf.sort_values(week_col, ascending=True)
+
+        weekly = (
+            gdf_sorted.groupby(week_col)
+            .size()
+            .reset_index(name="weekly_rows")
+            .sort_values(week_col)
+        )
+
+        weekly["running_total"] = weekly["weekly_rows"].cumsum()
+        total_group_rows = float(weekly["weekly_rows"].sum())
+        weekly["total_group_rows"] = total_group_rows
+        # Use a scalar guard here; `weekly["total_group_rows"]` is a Series and can't be used in `if`.
+        weekly["time_share"] = (weekly["running_total"] / total_group_rows) if total_group_rows > 0 else 0.0
+
+        if (weekly["time_share"] >= threshold).any():
+            # Cutoff is the first week where cumulative share reaches the desired threshold.
+            cutoff_week = weekly.loc[weekly["time_share"] >= threshold, week_col].min()
+        else:
+            # Degenerate case: if the threshold is never reached (e.g., tiny groups),
+            # fall back to putting all rows into train.
+            cutoff_week = weekly[week_col].max()
+
+        train_sub = gdf_sorted[gdf_sorted[week_col] <= cutoff_week].reset_index(drop=True)
+        test_sub = gdf_sorted[gdf_sorted[week_col] > cutoff_week].reset_index(drop=True)
+        train_parts.append(train_sub)
+        test_parts.append(test_sub)
+
+    train_df_pd = pd.concat(train_parts, ignore_index=True) if train_parts else df.iloc[0:0].copy()
+    test_df_pd = pd.concat(test_parts, ignore_index=True) if test_parts else df.iloc[0:0].copy()
 
     return (
         train_df_pd[feat_cols],
@@ -286,6 +364,28 @@ def temporal_train_val_split(df, feat_cols, target_col, test_fraction=0.2):
 
 # %% [markdown]
 # ## 6. MMT Training Function
+#
+# Defines the function executed in parallel by `ManyModelTraining` for each
+# partition (group). It builds the train/test matrices, trains the selected
+# regressor using the group hyperparameters, evaluates metrics, and attaches
+# them to the returned estimator for later logging/registration.
+#
+# ### Note on where models run (MMT execution model)
+#
+# A common concern is whether importing `snowflake.ml.modeling.*` estimators means
+# we are instantiating a “distributed model inside a node”.
+#
+# - **`ManyModelTraining` is the distributed system**: it partitions the input dataset
+#   (e.g., by `STATS_NTILE_GROUP`) and schedules **one partition per worker** in the
+#   Snowflake-managed runtime.
+# - Inside each worker, this function trains **a regular, single-partition estimator**
+#   on a **pandas DataFrame** for that partition. There is no nested distributed training
+#   happening inside the estimator.
+# - The estimators in `snowflake.ml.modeling.*` are **runtime-compatible wrappers** designed
+#   to work reliably inside Snowflake (dependencies, serialization, remote execution).
+#   Using “native” libraries directly (e.g., `xgboost.XGBRegressor`) can work in some setups,
+#   but may break packaging/serialization in the Snowflake runtime; hence the wrappers are
+#   the recommended choice for MMT.
 
 # %%
 def train_segment_model(data_connector, context):
@@ -315,6 +415,7 @@ def train_segment_model(data_connector, context):
     segment = context.partition_id
     print(f"\n[{segment}]")
 
+    # Each ManyModelTraining partition receives a single `STATS_NTILE_GROUP` slice.
     df         = data_connector.to_pandas()
     target_col = TARGET_COLUMN
     feat_cols  = _get_feature_cols_numeric(df, EXCLUDED_COLS)
@@ -327,15 +428,16 @@ def train_segment_model(data_connector, context):
     print(f"  Data: {df.shape}  target range [{_target_series.min():.2f}, {_target_series.max():.2f}]")
 
     # Temporal split: train = oldest 80% of weeks, test = most recent 20%
-    X_train, X_test, y_train, y_test = temporal_train_val_split(
+    X_train, X_test, y_train, y_test = temporal_train_val_split_pandas(
         df, feat_cols, target_col, test_fraction=0.2
     )
     print(f"  Train: {len(X_train):,}  Test: {len(X_test):,}  (temporal split — test = most recent 20% of weeks)")
 
-    train_dataset = X_train.apply(pd.to_numeric, errors="coerce").fillna(0).astype(float)
+    # Prepare numeric model matrices + labels.
+    train_dataset = X_train.apply(pd.to_numeric, errors="coerce").astype(float)
     train_dataset[target_col] = np.asarray(y_train, dtype=np.float64)
 
-    test_features = X_test.apply(pd.to_numeric, errors="coerce").fillna(0).astype(float)
+    test_features = X_test.apply(pd.to_numeric, errors="coerce").astype(float)
 
     # Resolve algorithm and hyperparameters
     model_type = GROUP_MODEL.get(segment, _DEFAULT_MODEL)
@@ -353,6 +455,7 @@ def train_segment_model(data_connector, context):
     INT_PARAMS_SET  = {"n_estimators", "max_depth", "num_leaves", "min_child_weight", "min_child_samples", "max_iter"}
     defaults        = DEFAULT_PARAMS_BY_MODEL.get(model_type, DEFAULT_PARAMS_BY_MODEL["XGBRegressor"])
     model_params    = {"random_state": 42}
+    # Cast/tidy hyperparameters so model constructors accept the right native types.
     for k, v in raw_params.items():
         native = v.item() if hasattr(v, "item") else v
         try:
@@ -376,6 +479,7 @@ def train_segment_model(data_connector, context):
     model = ModelClass(input_cols=feat_cols, label_cols=[target_col], **model_params)
     model.fit(train_dataset)
 
+    # Predict + compute evaluation metrics on the temporal holdout.
     pred_pd = model.predict(test_features)
     pred_pd = pred_pd.to_pandas() if hasattr(pred_pd, "to_pandas") else pred_pd
     y_pred  = np.asarray(pred_pd[model.get_output_cols()[0]])
@@ -383,12 +487,16 @@ def train_segment_model(data_connector, context):
     rmse   = float(np.sqrt(mean_squared_error(y_test, y_pred)))
     mae    = float(mean_absolute_error(y_test, y_pred))
     denom  = np.sum(np.abs(y_test))
-    wape   = float(np.sum(np.abs(y_test - y_pred)) / denom) if denom > 0 else 0.0
+    # WAPE is undefined when sum(|y|) == 0 (e.g., all actuals are 0).
+    # Returning 0.0 would be misleading if predictions are non-zero, so we emit NaN.
+    wape   = float(np.sum(np.abs(y_test - y_pred)) / denom) if denom > 0 else float("nan")
     mask   = np.abs(y_test) > 1e-8
     mape   = float((np.abs(y_test[mask] - y_pred[mask]) / np.abs(y_test[mask])).mean() * 100) if mask.any() else 0.0
 
     print(f"  RMSE={rmse:.2f}  MAE={mae:.2f}  WAPE={wape:.4f}  MAPE={mape:.2f}%")
 
+    # Attach metrics and metadata to the returned estimator for downstream
+    # registry logging in the main driver.
     model.rmse             = rmse
     model.mae              = mae
     model.wape             = wape
@@ -403,6 +511,10 @@ def train_segment_model(data_connector, context):
 
 # %% [markdown]
 # ## 7. Scale Cluster, Ray Dashboard, Run MMT
+#
+# Scales the runtime cluster for ManyModelTraining, optionally prints the
+# Ray dashboard URL, then launches one training job per partition
+# (partitioned by `STATS_NTILE_GROUP`).
 
 # %%
 try:
@@ -422,6 +534,7 @@ except Exception as e:
 # %%
 start_time   = time.time()
 trainer      = ManyModelTraining(train_segment_model, MMT_STAGE)
+# Launch distributed training for each `STATS_NTILE_GROUP` partition.
 training_run = trainer.run(
     partition_by=STATS_NTILE_GROUP_COL,
     snowpark_dataframe=training_df,
@@ -431,30 +544,53 @@ print(f"Run ID: {training_run.run_id}")
 
 # %% [markdown]
 # ## 8. Wait for MMT Completion
+#
+# Polls `training_run.partition_details` until all partitions finish (DONE)
+# and blocks until the run reaches a terminal state.
 
 # %%
-MMT_MAX_WAIT        = 600
 MMT_CHECK_INTERVAL  = 30
 elapsed = 0
+consecutive_poll_errors = 0
+POLL_ERROR_LIMIT = 5
+all_finished = False
 
-while elapsed < MMT_MAX_WAIT:
+while True:
     time.sleep(MMT_CHECK_INTERVAL)
     elapsed += MMT_CHECK_INTERVAL
     try:
         details     = training_run.partition_details
+        consecutive_poll_errors = 0
         total_count = len(details)
         done        = sum(1 for d in details.values() if d.status.name == "DONE")
         failed      = sum(1 for d in details.values() if d.status.name == "FAILED")
         print(f"  {elapsed}s — OK: {done}  FAILED: {failed}  pending: {total_count-done-failed}", end="\r")
         if done + failed == total_count:
             print(f"\nAll {total_count} partitions finished")
+            all_finished = True
             break
     except Exception as e:
         print(f"\npartition_details error: {str(e)[:180]}")
-        break
+        # Transient network/API errors shouldn't end the wait loop; retry on the
+        # next polling cycle so we don't proceed to registration prematurely.
+        consecutive_poll_errors += 1
+        if consecutive_poll_errors >= POLL_ERROR_LIMIT:
+            print(f"Too many consecutive polling errors ({POLL_ERROR_LIMIT}). Aborting wait.")
+            break
+        continue
+
+# Safety guard: do not proceed to registration if we couldn't confirm completion.
+if not all_finished:
+    raise RuntimeError(
+        "MMT did not reach a confirmed terminal state (DONE/FAILED for all partitions). "
+        "Aborting to avoid registering incomplete results."
+    )
 
 # %% [markdown]
 # ## 9. Partition Results
+#
+# Summarizes DONE vs FAILED partitions and prints key metrics (RMSE/MAE)
+# when available.
 
 # %%
 try:
@@ -482,6 +618,10 @@ print(f"\nSummary: {len(done_ids)} OK  {len(failed_ids)} FAILED  {len(partition_
 
 # %% [markdown]
 # ## 10. Register Models
+#
+# For every successful partition, logs the trained model into the registry,
+# attaches per-group metrics and hyperparameters, and sets the `PRODUCTION`
+# alias to the newly trained version.
 
 # %%
 registered_models = {}
@@ -496,9 +636,13 @@ for pid, details in partition_details.items():
         group_sid   = group_hp.get("search_id", "default")
         raw_hparams = group_hp.get("params", {})
 
+        # Build registry metrics: core metrics + optional hyperparameters snapshot.
         metrics = {
             "rmse": float(model.rmse), "mae": float(model.mae),
-            "wape": float(model.wape), "mape": float(model.mape),
+            # Keep WAPE as NaN when undefined (sum(|y|)==0). Note: depending on the
+            # backend/serialization, NaN may be stored as NULL; we prefer NaN over 0.0.
+            "wape": float(model.wape),
+            "mape": float(model.mape),
             "training_samples": int(model.training_samples),
             "test_samples": int(model.test_samples),
             "algorithm": group_alg, "group": pid,
@@ -537,6 +681,9 @@ print(f"\n{len(registered_models)}/16 models registered")
 
 # %% [markdown]
 # ## 11. Verify PRODUCTION Alias
+#
+# Lightweight check to confirm the `PRODUCTION` alias points to the new
+# registered version for each successfully trained group model.
 
 # %%
 for pid, info in registered_models.items():

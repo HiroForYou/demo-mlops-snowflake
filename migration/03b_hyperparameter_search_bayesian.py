@@ -8,7 +8,9 @@
 
 # %% [markdown]
 # ## 1. Setup
-
+#
+# Create the active Snowpark session and import Snowflake ML Bayesian tuning
+# utilities used by this script.
 # %%
 from snowflake.snowpark.context import get_active_session
 from snowflake.ml.modeling.tune import Tuner, TunerConfig, get_tuner_context, uniform
@@ -17,6 +19,7 @@ from snowflake.ml.data.data_connector import DataConnector
 from snowflake.ml.experiment import ExperimentTracking
 from datetime import datetime
 import numpy as np
+import pandas as pd
 import json
 import time
 
@@ -24,7 +27,9 @@ session = get_active_session()
 
 # %% [markdown]
 # ### 1A. Constants
-
+#
+# Define dataset/table identifiers, HPO configuration, and the mapping from
+# each `STATS_NTILE_GROUP` to the model family used for tuning.
 # %%
 DATABASE        = "BD_AA_DEV"
 STORAGE_SCHEMA  = "SC_STORAGE_BMX_PS"
@@ -42,6 +47,7 @@ TRAIN_TABLE_CLEANED         = f"{DATABASE}.{FEATURES_SCHEMA}.{FEATURE_STORE_NAME
 FEATURES_TABLE              = f"{DATABASE}.{FEATURES_SCHEMA}.{FEATURE_STORE_NAME}"
 HYPERPARAMETER_RESULTS_TABLE = f"{DATABASE}.{MODELS_SCHEMA}.HPO_{MODEL_NAME}"
 
+# Configuration names
 TARGET_COLUMN         = "UNI_BOX_WEEK"
 STATS_NTILE_GROUP_COL = "STATS_NTILE_GROUP"
 EXPERIMENT_DATE       = datetime.now().strftime("%Y%m%d")
@@ -117,7 +123,9 @@ SEARCH_SPACES = {
 
 # %% [markdown]
 # ## 2. Load Groups and Training Data
-
+#
+# Discover all available segment groups, then build the training DataFrame by
+# joining the engineered feature table with the target/label column.
 # %%
 groups_list = [
     row["GROUP_NAME"]
@@ -150,7 +158,9 @@ except Exception as e:
 
 # %% [markdown]
 # ## 3. Scale Cluster and Ray Dashboard
-
+#
+# Provision the compute resources for Bayesian HPO and try to print the Ray
+# dashboard URL for monitoring.
 # %%
 try:
     from snowflake.ml.runtime_cluster import scale_cluster
@@ -168,7 +178,10 @@ except Exception as e:
 
 # %% [markdown]
 # ## 4. Initialise ML Experiments
-
+#
+# Configure ML Experiments tracking so each group tuning run can be logged
+# consistently; if unavailable, the script falls back to inserting into a
+# Snowflake results table.
 # %%
 try:
     exp_tracking = ExperimentTracking(session)
@@ -199,6 +212,11 @@ if not experiments_available:
 
 # %% [markdown]
 # ## 5. Helper Functions
+#
+# Shared utilities across group searches:
+# - selecting the numeric feature columns used by the model
+# - computing the temporal train/validation split in Snowflake to keep
+#   validation weeks as the most recent ones (per `STATS_NTILE_GROUP`).
 
 # %%
 def _get_feature_cols_numeric(df, excluded_cols):
@@ -225,59 +243,91 @@ def _get_feature_cols_numeric(df, excluded_cols):
     ]
 
 
-def temporal_train_val_split(snowpark_df, feat_cols, target_col, test_fraction=0.2):
-    """Split a Snowpark DataFrame into temporal train and validation sets.
+def temporal_train_val_split_snowpark(snowpark_df, feat_cols, target_col, test_fraction=0.2):
+    """Split a Snowpark DataFrame into temporal train and validation sets (per group).
 
-    Data is pulled from Snowflake ordered by ``WEEK`` (ascending) so that the
-    validation set always corresponds to the most recent time periods.  This
-    avoids data leakage that would occur with a random shuffle.
+    This function implements a temporal holdout that is computed per `STATS_NTILE_GROUP`,
+    mirroring the cutoff-week logic used in `01_data_validation_and_cleaning.py`.
+    For each group, we compute a `cutoff_week` using weekly cumulative share ordered by
+    `WEEK` ascending, then assign:
+    - `train`: `WEEK <= cutoff_week`
+    - `val`:   `WEEK >  cutoff_week`
+
+    The split is computed fully in Snowflake (no `.to_pandas()`), and the returned
+    DataFrames include only ``feat_cols`` + ``target_col``.
 
     Parameters
     ----------
     snowpark_df : snowflake.snowpark.DataFrame
-        Source DataFrame containing at minimum the columns in ``feat_cols``,
-        ``target_col``, and ideally a ``WEEK`` column for ordering.
+        Source DataFrame containing at minimum:
+        - `WEEK` column (used for ordering)
+        - `STATS_NTILE_GROUP_COL` column (used to compute per-group cutoffs)
+        - the columns referenced in ``feat_cols`` and ``target_col``.
     feat_cols : list[str]
         Feature column names to include in X.
     target_col : str
         Name of the target column.
     test_fraction : float, optional
-        Fraction of the most-recent records to reserve for validation.
-        Default is 0.2 (last 20% of weeks = test set).
+        Fraction of the most-recent weeks reserved for validation (per group).
+        Default is 0.2.
 
     Returns
     -------
-    tuple[pandas.DataFrame, pandas.DataFrame, pandas.Series, pandas.Series]
-        ``(X_train, X_val, y_train, y_val)`` — all pandas objects, WEEK
-        column excluded from X.
+    tuple[snowflake.snowpark.DataFrame, snowflake.snowpark.DataFrame]
+        ``(train_df, val_df)`` Snowpark DataFrames.
+
+        Each DataFrame includes only ``feat_cols`` and ``target_col``.
+        The `WEEK` column is excluded from the returned DataFrames.
     """
     from snowflake.snowpark import functions as F
+    from snowflake.snowpark.window import Window
 
     week_col = next((c for c in snowpark_df.columns if c.upper() == "WEEK"), None)
+    group_col = next((c for c in snowpark_df.columns if c.upper() == STATS_NTILE_GROUP_COL.upper()), None)
 
-    select_exprs = [
-        *[F.coalesce(F.col(c), F.lit(0)).alias(c) for c in feat_cols],
-        F.coalesce(F.col(target_col), F.lit(0)).alias(target_col),
-    ]
-    if week_col:
-        select_exprs.append(F.col(week_col).alias("_WEEK_SORT"))
+    if not week_col:
+        raise ValueError("temporal_train_val_split_snowpark: column `WEEK` not found in input DataFrame")
+    if not group_col:
+        raise ValueError(
+            f"temporal_train_val_split_snowpark: column `{STATS_NTILE_GROUP_COL}` not found in input DataFrame"
+        )
 
-    df = snowpark_df.select(*select_exprs).to_pandas()
-
-    if "_WEEK_SORT" in df.columns:
-        df = df.sort_values("_WEEK_SORT", ascending=True, ignore_index=True)
-        df = df.drop(columns=["_WEEK_SORT"])
-
-    split_idx   = int(len(df) * (1.0 - test_fraction))
-    train_df_pd = df.iloc[:split_idx].reset_index(drop=True)
-    val_df_pd   = df.iloc[split_idx:].reset_index(drop=True)
-
-    return (
-        train_df_pd[feat_cols],
-        val_df_pd[feat_cols],
-        train_df_pd[target_col],
-        val_df_pd[target_col],
+    base_df = snowpark_df.select(
+        *[F.col(c).alias(c) for c in feat_cols],
+        F.col(target_col).alias(target_col),
+        F.col(week_col).alias("_WEEK_SORT"),
+        F.col(group_col).alias("_GROUP_SORT"),
+    ).filter(
+        F.col("_WEEK_SORT").is_not_null() & F.col("_GROUP_SORT").is_not_null()
     )
+
+    weekly_counts = (
+        base_df.group_by("_GROUP_SORT", "_WEEK_SORT")
+        .agg(F.count(F.lit(1)).alias("weekly_rows"))
+    )
+
+    w_ordered = Window.partition_by("_GROUP_SORT").order_by("_WEEK_SORT")
+    with_cumsums = weekly_counts.select(
+        "_GROUP_SORT",
+        "_WEEK_SORT",
+        "weekly_rows",
+        F.sum(F.col("weekly_rows")).over(w_ordered).alias("running_total"),
+        F.sum(F.col("weekly_rows")).over(Window.partition_by("_GROUP_SORT")).alias("total_group_rows"),
+    )
+
+    # Define temporal cutoff per group (validation must use "future" weeks).
+    threshold = 1.0 - float(test_fraction)
+    cutoff_df = (
+        with_cumsums.filter((F.col("running_total") / F.col("total_group_rows")) >= threshold)
+        .group_by("_GROUP_SORT")
+        .agg(F.min(F.col("_WEEK_SORT")).alias("_CUTOFF_WEEK"))
+    )
+
+    split_df = base_df.join(cutoff_df, on="_GROUP_SORT", how="inner")
+    train_df = split_df.filter(F.col("_WEEK_SORT") <= F.col("_CUTOFF_WEEK")).select(*feat_cols, target_col)
+    val_df = split_df.filter(F.col("_WEEK_SORT") > F.col("_CUTOFF_WEEK")).select(*feat_cols, target_col)
+
+    return train_df, val_df
 
 
 stats_ntile_col = STATS_NTILE_GROUP_COL
@@ -289,6 +339,10 @@ all_results = {}
 
 # %% [markdown]
 # ## 6. Training Function for Tuner
+#
+# Defines the closure passed to Snowflake ML `Tuner`. For each BayesOpt trial,
+# it pulls hyperparameters from `tuner_context`, trains the selected regressor
+# on the provided train split, and reports RMSE/MAE/WAPE/MAPE back to the tuner.
 
 # %%
 def create_train_func_for_tuner(feature_cols, model_type, target_col):
@@ -321,9 +375,9 @@ def create_train_func_for_tuner(feature_cols, model_type, target_col):
 
         train_pd      = dm["train"].to_pandas()
         test_pd       = dm["test"].to_pandas()
-        train_dataset = train_pd[feature_cols + [target_col]].fillna(0)
-        test_features = test_pd[feature_cols].fillna(0)
-        y_val         = test_pd[target_col].fillna(0).values
+        train_dataset = train_pd[feature_cols + [target_col]]
+        test_features = test_pd[feature_cols]
+        y_val         = test_pd[target_col].values
 
         model_params = {**params, "random_state": 42}
         # Cast integer params (BayesOpt samples them as floats via uniform())
@@ -362,6 +416,10 @@ def create_train_func_for_tuner(feature_cols, model_type, target_col):
 
 # %% [markdown]
 # ## 7. Search Function (per group)
+#
+# Runs Bayesian HPO for a single `STATS_NTILE_GROUP`:
+# sampling (optional), feature discovery, temporal split, `tuner.run()`,
+# extraction of best hyperparameters, and logging of validation metrics.
 
 # %%
 def run_hyperparameter_search_for_one_group(group_name, group_snowpark_df):
@@ -390,6 +448,7 @@ def run_hyperparameter_search_for_one_group(group_name, group_snowpark_df):
         print(f"  Skipping: only {group_count} records (< 50)")
         return None
 
+    # Optional downsampling to reduce HPO cost per group.
     if SAMPLE_RATE_PER_GROUP < 1.0:
         sampled_df    = group_snowpark_df.sample(frac=SAMPLE_RATE_PER_GROUP)
         sampled_count = sampled_df.count()
@@ -398,6 +457,7 @@ def run_hyperparameter_search_for_one_group(group_name, group_snowpark_df):
         sampled_count = group_count
     print(f"  Records: {sampled_count:,} ({SAMPLE_RATE_PER_GROUP*100:.0f}% of {group_count:,})")
 
+    # Use one sampled row as a schema reference to infer numeric feature columns.
     sample_row = sampled_df.limit(1).to_pandas()
     target_col = TARGET_COLUMN
     feat_cols  = _get_feature_cols_numeric(sample_row, EXCLUDED_COLS)
@@ -406,19 +466,20 @@ def run_hyperparameter_search_for_one_group(group_name, group_snowpark_df):
         print("  Skipping: not enough data for train/val split")
         return None
 
-    # Temporal split: train = oldest 80% of weeks, val = most recent 20%
-    X_train, X_val, y_train, y_val = temporal_train_val_split(
+    # Temporal split per group (computed in Snowflake)
+    train_sp_df, val_sp_df = temporal_train_val_split_snowpark(
         sampled_df, feat_cols, target_col, test_fraction=0.2
     )
-    print(f"  Train: {len(X_train):,}  Val: {len(X_val):,}  (temporal split — test = most recent 20% of weeks)")
+    train_count = train_sp_df.count()
+    val_count = val_sp_df.count()
+    print(
+        f"  Train: {train_count:,}  Val: {val_count:,}  "
+        "(temporal split per group — newest weeks -> val)"
+    )
 
-    train_data = X_train.copy()
-    train_data[target_col] = np.asarray(y_train)
-    val_data = X_val.copy()
-    val_data[target_col] = np.asarray(y_val)
-
-    train_dc = DataConnector.from_dataframe(session.create_dataframe(train_data))
-    val_dc   = DataConnector.from_dataframe(session.create_dataframe(val_data))
+    # Snowflake ML Tuner can consume Snowpark DataFrames via DataConnector.
+    train_dc = DataConnector.from_dataframe(train_sp_df)
+    val_dc = DataConnector.from_dataframe(val_sp_df)
 
     model_type   = GROUP_MODEL.get(group_name, _DEFAULT_MODEL)
     train_func   = create_train_func_for_tuner(feat_cols, model_type, target_col)
@@ -432,10 +493,12 @@ def run_hyperparameter_search_for_one_group(group_name, group_snowpark_df):
 
     try:
         t0      = time.time()
+        # Run BayesOpt HPO against the Snowflake ML tuner datasets (train/val split).
         tuner   = Tuner(train_func, SEARCH_SPACES[model_type], tuner_config)
         results = tuner.run(dataset_map={"train": train_dc, "test": val_dc})
 
         best_result = results.best_result
+        # `best_result` encodes best hyperparameters in columns starting with `config/`.
         config_cols = [c for c in best_result.columns if str(c).startswith("config/")]
         best_params = {
             str(c).replace("config/", ""): (
@@ -446,7 +509,16 @@ def run_hyperparameter_search_for_one_group(group_name, group_snowpark_df):
         best_rmse  = float(best_result["rmse"].iloc[0])
         best_model = results.best_model
 
-        pred_pd  = best_model.predict(X_val)
+        # Validation metrics on pandas copies (features/label).
+        # Driver-side metrics for reporting (Snowflake ML tuner already uses val_dc internally).
+        # We replicate prediction + metrics here for consistent printing and extra metric computation.
+        X_val_pd = val_sp_df.select(feat_cols).to_pandas()
+        # Robust numeric coercion: prevents ValueError if any feature arrives as object/string.
+        X_val_pd = X_val_pd.apply(pd.to_numeric, errors="coerce").astype(float)
+        y_val_pd = val_sp_df.select(target_col).to_pandas()[target_col]
+        y_val    = pd.to_numeric(y_val_pd, errors="coerce").astype(float).values
+
+        pred_pd  = best_model.predict(X_val_pd)
         pred_pd  = pred_pd.to_pandas() if hasattr(pred_pd, "to_pandas") else pred_pd
         y_pred   = np.asarray(pred_pd[best_model.get_output_cols()[0]])
         val_rmse = float(np.sqrt(mean_squared_error(y_val, y_pred)))
@@ -462,6 +534,7 @@ def run_hyperparameter_search_for_one_group(group_name, group_snowpark_df):
         search_id           = f"bayes_{group_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         saved_to_experiments = False
 
+        # Persist best params/metrics for this group (Experiments preferred, fallback table otherwise).
         if experiments_available:
             try:
                 run_name = f"best_{group_name}_{datetime.now().strftime('%H%M%S')}"
@@ -506,6 +579,9 @@ def run_hyperparameter_search_for_one_group(group_name, group_snowpark_df):
 
 # %% [markdown]
 # ## 8. Execute Search Loop
+#
+# Driver loop that iterates over every discovered group and stores best
+# hyperparameters/metrics into ML Experiments (or the fallback results table).
 
 # %%
 start_time    = time.time()
@@ -522,6 +598,9 @@ print(f"\nCompleted {successful}/{len(groups_list)} groups in {elapsed_min:.1f} 
 
 # %% [markdown]
 # ## 9. Summary
+#
+# Prints a consolidated view of how many groups completed successfully and
+# the resulting validation RMSE statistics.
 
 # %%
 if experiments_available:
@@ -544,6 +623,8 @@ if all_results:
 
 # %% [markdown]
 # ## 10. Scale Cluster Down
+#
+# Releases compute resources after the Bayesian tuning run ends.
 
 # %%
 try:

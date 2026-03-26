@@ -5,6 +5,11 @@
 # materialization.  Steps performed:
 # 1. Validate table structure and data quality for both datasets.
 # 2. Clean data (remove NULLs, cap outliers at the 99th percentile).
+#    Note: "cap" is implemented as a filter that DROPS rows whose target
+#    exceeds the computed 99th-percentile threshold (global across the
+#    training dataset, not per group).
+#    The outlier recoding/filter is OPTIONAL and controlled by
+#    `APPLY_OUTLIER_FILTER_P99` (default: False).
 # 3. Verify feature column compatibility between training and inference.
 # 4. Generate a per-group distribution report for STATS_NTILE_GROUP.
 
@@ -41,6 +46,10 @@ STATS_NTILE_GROUP_COL = "STATS_NTILE_GROUP"
 
 HOLDOUT_FRACTION = 0.10  # 10% temporal holdout for baseline drift
 
+# Optional label outlier cleaning (P99).
+# When False, the temporal split is computed without dropping label outliers.
+APPLY_OUTLIER_FILTER_P99 = False
+
 # Metadata / identifier columns excluded from the feature set
 EXCLUDED_COLS = [
     "CUSTOMER_ID",
@@ -56,6 +65,9 @@ print(f"Session: {session.get_current_database()}.{session.get_current_schema()}
 
 # %% [markdown]
 # ## 2. Validate Training Dataset
+#
+# Ensures the structured training table is reachable, reports row/column
+# information, and verifies that the expected target column exists.
 
 # %%
 try:
@@ -76,6 +88,9 @@ else:
 
 # %% [markdown]
 # ## 3. Validate Inference Dataset
+#
+# Confirms that the structured inference table is reachable and that the
+# target column is absent (as expected for inference-only datasets).
 
 # %%
 try:
@@ -95,6 +110,9 @@ else:
 
 # %% [markdown]
 # ## 4. Data Quality — NULL Values
+#
+# Computes null counts for the target and key identifier columns in the
+# training dataset to quantify data quality issues before cleaning.
 
 # %%
 print("\nNULL check — training data:")
@@ -110,6 +128,9 @@ session.sql(f"""
 
 # %% [markdown]
 # ## 5. Target Variable Distribution
+#
+# Summarizes the target distribution (min/max/mean/std and percentiles) and
+# reports potential outliers as a sanity check prior to label cleaning.
 
 # %%
 print("Target variable statistics:")
@@ -144,7 +165,34 @@ session.sql(f"""
 """).show()
 
 # %% [markdown]
+# ## Outlier Handling — P99 Threshold (Justification)
+#
+# The pipeline uses a robust label cleaning strategy based on a P99 target threshold.
+# When `APPLY_OUTLIER_FILTER_P99=True`, the P99 threshold is computed after the
+# temporal `cutoff_week` is known and is estimated ONLY from the TRAIN window
+# (`WEEK <= cutoff_week`). This avoids using holdout label information to estimate
+# the cleaning threshold.
+
+
+# %%
+# The actual P99 computation is deferred until after `temp_thresholds_table`
+# is created (so we know the TRAIN window precisely). This makes the decision
+# auditable and prevents label leakage into the threshold estimation.
+p99_threshold = None
+if APPLY_OUTLIER_FILTER_P99:
+    print(
+        "\nOutlier filter (P99): ENABLED. P99 threshold computation will be deferred "
+        "until after the temporal cutoff_week is computed, and will be estimated ONLY "
+        "from the TRAIN window (WEEK <= cutoff_week)."
+    )
+else:
+    print("\nOutlier filter (P99): DISABLED. No P99 label filtering will be applied.")
+
+# %% [markdown]
 # ## 6. Feature Compatibility Check
+#
+# Verifies that feature columns used for training match those available for
+# inference by comparing column sets after excluding identifiers/metadata.
 
 # %%
 excluded_cols_set = set(EXCLUDED_COLS)
@@ -174,24 +222,31 @@ if not missing_in_inference and not missing_in_train:
 # Split the cleaned data temporally by group: newest X% becomes the holdout set
 # We use a TEMPORARY TABLE of thresholds to avoid Data Skew when ordering 
 # millions of rows in a few partitions. 
+# 0. Optional: label outlier filtering (P99) is applied AFTER cutoff_week is computed.
+#    If enabled, P99 is estimated ONLY from the TRAIN window (WEEK <= cutoff_week).
 # 1. We count records per group and per week (fast aggregation).
 # 2. We calculate the cumulative sum of records to find the 90% threshold week.
 temp_thresholds_table = f"{TRAIN_TABLE_CLEANED}_TEMP_THRESHOLDS"
 
+# Build optional outlier filter snippets (placeholders overwritten after P99 is computed).
+p99_threshold_sql = str(p99_threshold) if p99_threshold is not None else None
+outlier_filter_base = (
+    f"AND {TARGET_COLUMN} <= {p99_threshold_sql}" if APPLY_OUTLIER_FILTER_P99 else ""
+)
+outlier_filter_t = (
+    f"AND t.{TARGET_COLUMN} <= {p99_threshold_sql}" if APPLY_OUTLIER_FILTER_P99 else ""
+)
+
 session.sql(f"""
-    CREATE TEMPORARY TABLE {temp_thresholds_table} AS
+    CREATE OR REPLACE TEMPORARY TABLE {temp_thresholds_table} AS
     WITH base_filtered AS (
         SELECT {STATS_NTILE_GROUP_COL}, WEEK, COUNT(*) as weekly_rows
         FROM {TRAIN_TABLE_STRUCTURED}
         WHERE {TARGET_COLUMN} IS NOT NULL
           AND CUSTOMER_ID IS NOT NULL
           AND WEEK IS NOT NULL
+          AND {STATS_NTILE_GROUP_COL} IS NOT NULL
           AND {TARGET_COLUMN} >= 0
-          AND {TARGET_COLUMN} <= (
-              SELECT PERCENTILE_CONT(0.99) WITHIN GROUP (ORDER BY {TARGET_COLUMN})
-              FROM {TRAIN_TABLE_STRUCTURED}
-              WHERE {TARGET_COLUMN} IS NOT NULL
-          )
         GROUP BY {STATS_NTILE_GROUP_COL}, WEEK
     ),
     cumulative_counts AS (
@@ -217,6 +272,44 @@ session.sql(f"""
     SELECT * FROM thresholds
 """).collect()
 
+# 2b. Compute P99 (optional) using ONLY the TRAIN window (no holdout leakage)
+if APPLY_OUTLIER_FILTER_P99:
+    p99_threshold = session.sql(f"""
+        SELECT PERCENTILE_CONT(0.99) WITHIN GROUP (ORDER BY t.{TARGET_COLUMN}) AS P99
+        FROM {TRAIN_TABLE_STRUCTURED} t
+        JOIN {temp_thresholds_table} th
+          ON t.{STATS_NTILE_GROUP_COL} = th.{STATS_NTILE_GROUP_COL}
+        WHERE t.{TARGET_COLUMN} IS NOT NULL
+          AND t.CUSTOMER_ID IS NOT NULL
+          AND t.WEEK IS NOT NULL
+          AND t.{STATS_NTILE_GROUP_COL} IS NOT NULL
+          AND t.{TARGET_COLUMN} >= 0
+          AND t.WEEK <= th.cutoff_week
+    """).collect()[0]["P99"]
+
+    print(f"\nOutlier filter (P99 computed from TRAIN window): {TARGET_COLUMN} <= {p99_threshold}")
+
+    # Update SQL snippets used to filter TRAIN/HOLDOUT rows.
+    outlier_filter_base = f"AND {TARGET_COLUMN} <= {p99_threshold}"
+    outlier_filter_t = f"AND t.{TARGET_COLUMN} <= {p99_threshold}"
+
+    outlier_counts = session.sql(f"""
+        SELECT
+            COUNT(*) AS candidate_rows,
+            SUM(CASE WHEN {TARGET_COLUMN} > {p99_threshold} THEN 1 ELSE 0 END) AS outlier_rows_removed
+        FROM {TRAIN_TABLE_STRUCTURED}
+        WHERE {TARGET_COLUMN} IS NOT NULL
+          AND CUSTOMER_ID IS NOT NULL
+          AND WEEK IS NOT NULL
+          AND {STATS_NTILE_GROUP_COL} IS NOT NULL
+          AND {TARGET_COLUMN} >= 0
+    """).collect()[0]
+
+    print(
+        "Rows removed as outliers (target > P99): "
+        f"{outlier_counts['OUTLIER_ROWS_REMOVED']:,} / {outlier_counts['CANDIDATE_ROWS']:,}"
+    )
+
 # 3. Create the Training Cleaned Table (<= cutoff_week)
 session.sql(f"""
     CREATE OR REPLACE TABLE {TRAIN_TABLE_CLEANED} AS
@@ -228,11 +321,7 @@ session.sql(f"""
       AND t.CUSTOMER_ID IS NOT NULL
       AND t.WEEK IS NOT NULL
       AND t.{TARGET_COLUMN} >= 0
-      AND t.{TARGET_COLUMN} <= (
-          SELECT PERCENTILE_CONT(0.99) WITHIN GROUP (ORDER BY t2.{TARGET_COLUMN})
-          FROM {TRAIN_TABLE_STRUCTURED} t2
-          WHERE t2.{TARGET_COLUMN} IS NOT NULL
-      )
+      {outlier_filter_t}
       AND t.WEEK <= th.cutoff_week
 """).collect()
 
@@ -247,11 +336,7 @@ session.sql(f"""
       AND t.CUSTOMER_ID IS NOT NULL
       AND t.WEEK IS NOT NULL
       AND t.{TARGET_COLUMN} >= 0
-      AND t.{TARGET_COLUMN} <= (
-          SELECT PERCENTILE_CONT(0.99) WITHIN GROUP (ORDER BY t3.{TARGET_COLUMN})
-          FROM {TRAIN_TABLE_STRUCTURED} t3
-          WHERE t3.{TARGET_COLUMN} IS NOT NULL
-      )
+      {outlier_filter_t}
       AND t.WEEK > th.cutoff_week
 """).collect()
 
@@ -259,6 +344,29 @@ cleaned_train_count   = session.table(TRAIN_TABLE_CLEANED).count()
 cleaned_holdout_count = session.table(TRAIN_TABLE_HOLDOUT).count()
 print(f"TRAIN_DATASET_CLEANED: {cleaned_train_count:,} rows (Train {1.0 - HOLDOUT_FRACTION:.0%})")
 print(f"TRAIN_DATASET_HOLDOUT: {cleaned_holdout_count:,} rows (Holdout {HOLDOUT_FRACTION:.0%})")
+
+# Consistency check: temporal split should not drop/duplicate rows.
+# We compare against the "candidate" set used by `base_filtered` (i.e., original
+# TRAIN_TABLE_STRUCTURED after applying label cleaning + NULL checks), so
+# TRAIN + HOLDOUT should sum to that candidate total.
+cleaned_total_count = cleaned_train_count + cleaned_holdout_count
+candidate_total_count = session.sql(f"""
+    SELECT COUNT(*) AS candidate_rows
+    FROM {TRAIN_TABLE_STRUCTURED}
+    WHERE {TARGET_COLUMN} IS NOT NULL
+      AND CUSTOMER_ID IS NOT NULL
+      AND WEEK IS NOT NULL
+      AND {STATS_NTILE_GROUP_COL} IS NOT NULL
+      AND {TARGET_COLUMN} >= 0
+      {outlier_filter_base}
+""").collect()[0]["CANDIDATE_ROWS"]
+
+raw_training_total_count = total_rows
+split_consistency_diff = cleaned_total_count - candidate_total_count
+split_consistency_ok = (split_consistency_diff == 0)
+
+cleaned_vs_raw_diff = cleaned_total_count - raw_training_total_count
+cleaned_vs_raw_ok = (cleaned_vs_raw_diff == 0)
 
 session.sql(f"""
     CREATE OR REPLACE TABLE {INFERENCE_TABLE_CLEANED} AS
@@ -272,6 +380,9 @@ print(f"INFERENCE_DATASET_CLEANED: {cleaned_inference_count:,} rows")
 
 # %% [markdown]
 # ## 8. Validate STATS_NTILE_GROUP Segmentation
+#
+# Audits the per-group segmentation to ensure the expected number of groups
+# exists and that each group has sufficient training records.
 
 # %%
 if STATS_NTILE_GROUP_COL not in columns:
@@ -343,4 +454,63 @@ print(f"   Holdout rows (cleaned {HOLDOUT_FRACTION*100:.0f}%):  {cleaned_holdout
 print(f"   Inference rows (cleaned):    {cleaned_inference_count:,}")
 print(f"   STATS_NTILE_GROUP groups: {group_count}")
 print(f"   Minimum records per group (Train): {min_records}")
-print("\nNext: 02_feature_store_setup.py")
+
+print("\nTemporal split consistency (audit):")
+print(f"   Candidate rows: {candidate_total_count:,}")
+print(f"   Cleaned train+holdout rows: {cleaned_total_count:,}")
+if split_consistency_ok:
+    print("   OK: candidate_total_count == cleaned_total_count")
+else:
+    print(
+        f"   WARNING: candidate vs cleaned mismatch. "
+        f"(cleaned_total - candidate_total) = {split_consistency_diff:,}"
+    )
+
+print(f"   Original training structured rows: {raw_training_total_count:,}")
+if cleaned_vs_raw_ok:
+    print("   OK: cleaned_total_count == raw_training_total_count")
+else:
+    print(
+        "   NOTE: Cleaned train+holdout do not sum to original training structured. "
+        f"(cleaned_total - raw_training_total_count) = {cleaned_vs_raw_diff:,}. "
+        "This is expected when data cleaning removes rows before the temporal split "
+        "(NULL target / NULL CUSTOMER_ID / NULL WEEK / target < 0 / target > P99 / "
+        "and rows with STATS_NTILE_GROUP IS NULL)."
+    )
+
+print(f"\nOutlier P99 filter enabled? {APPLY_OUTLIER_FILTER_P99}")
+if APPLY_OUTLIER_FILTER_P99:
+    print(f"   P99 threshold used: {p99_threshold}")
+else:
+    pass
+
+holdout_share_pct = (cleaned_holdout_count / cleaned_total_count * 100.0) if cleaned_total_count else 0.0
+
+print(f"   Actual holdout share (by rows): {holdout_share_pct:.2f}%")
+
+print("\nTemporal cutoff week per group (TRAIN uses WEEK <= cutoff_week):")
+session.sql(f"""
+    SELECT
+        {STATS_NTILE_GROUP_COL} AS GROUP_NAME,
+        cutoff_week
+    FROM {temp_thresholds_table}
+    ORDER BY {STATS_NTILE_GROUP_COL}
+""").show()
+
+# %% [markdown]
+# ### Audit notes: temporal split + P99 label cleaning
+#
+# #### 1) Why the split is not exactly 10%
+# - This split is temporal and is computed by whole `WEEK` periods per `STATS_NTILE_GROUP`.
+# - `TRAIN` uses `WEEK <= cutoff_week` and `HOLDOUT` uses `WEEK > cutoff_week`.
+# - `cutoff_week` is chosen as the first week where the cumulative share reaches/exceeds
+#   the threshold `(1 - HOLDOUT_FRACTION)`.
+# - Because volumes are aggregated by weeks (not per-row), the resulting holdout share can differ
+#   slightly from the configured 10% (e.g., 9.23%).
+#
+# #### 2) Label leakage risk when `APPLY_OUTLIER_FILTER_P99=True`
+# - When enabled, the P99 threshold is computed ONLY from the TRAIN window (`WEEK <= cutoff_week`).
+# - The holdout period is NOT used to estimate the threshold; therefore, the cleaning rule
+#   does not depend on holdout labels.
+# - After the threshold is fixed, the same P99 rule is applied consistently to both TRAIN and
+#   HOLDOUT rows to cap extreme label values.
