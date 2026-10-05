@@ -8,7 +8,7 @@ Migration of a complete MLOps workflow from Databricks to Snowflake: data valida
 
 | Folder | Content |
 |---|---|
-| `migration/` | **Main project**: the full MLOps workflow migrated to Snowflake |
+| `migration/` | Main project: MLOps workflow migrated to Snowflake |
 | `databricks/` | Original Databricks code (training, inference, monitoring) |
 | `demo-original/` | Original demos in notebook format |
 | `demo-fine/` | Refined versions of the demos |
@@ -17,7 +17,7 @@ Migration of a complete MLOps workflow from Databricks to Snowflake: data valida
 
 ## Main project: `migration/`
 
-Sequential scripts, run in numerical order. Each `.py` has a matching notebook in `migration/notebooks/`.
+Scripts run in numerical order; `03` and `03b` are alternatives (run one). Each `.py` has a matching notebook in `migration/notebooks/`.
 
 ### Training
 
@@ -26,7 +26,7 @@ Sequential scripts, run in numerical order. Each `.py` has a matching notebook i
 | `01_data_validation_and_cleaning.py` | Validate and clean the training and inference datasets |
 | `02_feature_store_setup.py` | Build and materialize the feature dataset |
 | `03_hyperparameter_search.py` | Per-group hyperparameter search (LGBM / XGB) with `RandomSearch` |
-| `03b_hyperparameter_search_bayesian.py` | Same search using Bayesian optimization (`BayesOpt`) |
+| `03b_hyperparameter_search_bayesian.py` | Alternative to `03`: same search with Bayesian optimization (`BayesOpt`) |
 | `04_many_model_training.py` | Train one model per group (16 models) and register them in the Model Registry |
 | `05_create_partitioned_model.py` | Wrap the 16 models into a single partitioned model |
 
@@ -56,7 +56,7 @@ Sequential scripts, run in numerical order. Each `.py` has a matching notebook i
 
 ## Documentation
 
-Located in `migration/docs/` (in Spanish): business blueprint (`documento-bbp.md`), knowledge transfer (`documento-kt.md`), naming convention and table dictionary.
+`migration/docs/` (in Spanish): business blueprint (`documento-bbp.md`), knowledge transfer (`documento-kt.md`), naming convention and table dictionary.
 
 ## Utilities
 

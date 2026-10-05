@@ -8,7 +8,7 @@ Migración de un flujo MLOps completo desde Databricks hacia Snowflake: validaci
 
 | Carpeta | Contenido |
 |---|---|
-| `migration/` | **Proyecto principal**: flujo MLOps completo migrado a Snowflake |
+| `migration/` | Proyecto principal: flujo MLOps migrado a Snowflake |
 | `databricks/` | Código original de Databricks (training, inference, monitoring) |
 | `demo-original/` | Demos originales en formato notebook |
 | `demo-fine/` | Versiones refinadas de los demos |
@@ -17,7 +17,7 @@ Migración de un flujo MLOps completo desde Databricks hacia Snowflake: validaci
 
 ## Proyecto principal: `migration/`
 
-Scripts secuenciales, ejecutados en orden numérico. Cada `.py` tiene su notebook equivalente en `migration/notebooks/`.
+Scripts ejecutados en orden numérico; `03` y `03b` son alternativos (ejecutar uno). Cada `.py` tiene su notebook equivalente en `migration/notebooks/`.
 
 ### Entrenamiento
 
@@ -26,7 +26,7 @@ Scripts secuenciales, ejecutados en orden numérico. Cada `.py` tiene su noteboo
 | `01_data_validation_and_cleaning.py` | Validación y limpieza de los datasets de entrenamiento e inferencia |
 | `02_feature_store_setup.py` | Construcción y materialización del dataset de features |
 | `03_hyperparameter_search.py` | Búsqueda de hiperparámetros por grupo (LGBM / XGB) con `RandomSearch` |
-| `03b_hyperparameter_search_bayesian.py` | Misma búsqueda con optimización bayesiana (`BayesOpt`) |
+| `03b_hyperparameter_search_bayesian.py` | Alternativa a `03`: misma búsqueda con optimización bayesiana (`BayesOpt`) |
 | `04_many_model_training.py` | Entrenamiento de un modelo por grupo (16 modelos) y registro en el Model Registry |
 | `05_create_partitioned_model.py` | Integración de los 16 modelos en un único modelo particionado |
 
@@ -56,7 +56,7 @@ Scripts secuenciales, ejecutados en orden numérico. Cada `.py` tiene su noteboo
 
 ## Documentación
 
-En `migration/docs/`: business blueprint (`documento-bbp.md`), transferencia de conocimiento (`documento-kt.md`), convención de nombres y diccionario de tablas.
+`migration/docs/`: business blueprint (`documento-bbp.md`), transferencia de conocimiento (`documento-kt.md`), convención de nombres y diccionario de tablas.
 
 ## Utilidades
 
